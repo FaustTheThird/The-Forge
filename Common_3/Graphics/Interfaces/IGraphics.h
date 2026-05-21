@@ -2959,6 +2959,15 @@ void cmdDrawInstanced(Cmd* pCmd, uint32_t vertexCount, uint32_t firstVertex, uin
 void cmdDrawIndexed(Cmd* pCmd, uint32_t indexCount, uint32_t firstIndex, uint32_t firstVertex);
 void cmdDrawIndexedInstanced(Cmd* pCmd, uint32_t indexCount, uint32_t firstIndex, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance);
 void cmdDispatch(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
+// BloomEngine M6.6 B.4: launch a mesh-shader pipeline. Group counts
+// drive the amplification stage when present (one AS thread group per
+// (x, y, z) coordinate); the AS shader then internally calls DispatchMesh
+// to launch the MS for surviving meshlets. MS-only pipelines treat the
+// group count as the mesh-shader thread-group dispatch directly.
+// D3D12: ID3D12GraphicsCommandList6::DispatchMesh. Vulkan/Metal stub +
+// abort -- mesh-shader Vulkan / Metal land in M9+. CPU-side indirect
+// dispatch is deferred until a use case requires it.
+void cmdDispatchMesh(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
 
 // Transition Commands
 void cmdResourceBarrier(Cmd* pCmd, uint32_t bufferBarrierCount, BufferBarrier* pBufferBarriers, uint32_t textureBarrierCount, TextureBarrier* pTextureBarriers, uint32_t rtBarrierCount, RenderTargetBarrier* pRtBarriers);

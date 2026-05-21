@@ -4412,6 +4412,20 @@ void cmdDispatch(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t
     [pCmd->pComputeEncoder dispatchThreadgroups:threadgroupCount threadsPerThreadgroup:pCmd->pBoundPipeline->mNumThreadsPerGroup];
 }
 
+// BloomEngine M6.6 B.5: Metal mesh-shader bring-up deferred to M9+
+// (would map onto MTLMeshRenderPipelineDescriptor +
+// drawMeshThreadgroups). Stub so a stray cmdDispatchMesh call on Metal
+// fails loudly rather than silently no-op'ing.
+void cmdDispatchMesh(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
+{
+    UNREF_PARAM(pCmd);
+    UNREF_PARAM(groupCountX);
+    UNREF_PARAM(groupCountY);
+    UNREF_PARAM(groupCountZ);
+    LOGF(eERROR, "cmdDispatchMesh: Metal mesh-shader backend not implemented (M9+).");
+    ASSERTFAIL("cmdDispatchMesh: Metal stub hit");
+}
+
 void cmdExecuteIndirect(Cmd* pCmd, IndirectArgumentType type, uint maxCommandCount, Buffer* pIndirectBuffer, uint64_t bufferOffset,
                         Buffer* pCounterBuffer, uint64_t counterBufferOffset)
 {

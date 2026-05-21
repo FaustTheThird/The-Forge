@@ -8401,6 +8401,20 @@ void cmdDispatch(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t
     vkCmdDispatch(pCmd->mVk.pCmdBuf, groupCountX, groupCountY, groupCountZ);
 }
 
+// BloomEngine M6.6 B.5: Vulkan mesh-shader bring-up deferred to M9+
+// (Apple Silicon + Vulkan path is not load-bearing for the D3D12 dev
+// box). Stub so a stray cmdDispatchMesh call on Vulkan fails loudly
+// rather than silently no-op'ing.
+void cmdDispatchMesh(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
+{
+    UNREF_PARAM(pCmd);
+    UNREF_PARAM(groupCountX);
+    UNREF_PARAM(groupCountY);
+    UNREF_PARAM(groupCountZ);
+    LOGF(eERROR, "cmdDispatchMesh: Vulkan mesh-shader backend not implemented (M9+).");
+    ASSERTFAIL("cmdDispatchMesh: Vulkan stub hit");
+}
+
 void cmdResourceBarrier(Cmd* pCmd, uint32_t numBufferBarriers, BufferBarrier* pBufferBarriers, uint32_t numTextureBarriers,
                         TextureBarrier* pTextureBarriers, uint32_t numRtBarriers, RenderTargetBarrier* pRtBarriers)
 {

@@ -5822,6 +5822,18 @@ void cmdDispatch(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t
 #endif
 }
 
+// BloomEngine M6.6 B.4: mesh-shader pipeline dispatch. The cast to
+// ID3D12GraphicsCommandList6 follows the same pattern Forge uses for
+// CreateStateObject on ID3D12Device5 -- the runtime command list is
+// always the highest-version interface; the cast is safe.
+void cmdDispatchMesh(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
+{
+    ASSERT(pCmd);
+    ASSERT(pCmd->mDx.pCmdList);
+    COM_CALL(DispatchMesh, (ID3D12GraphicsCommandList6*)pCmd->mDx.pCmdList,
+             (UINT)groupCountX, (UINT)groupCountY, (UINT)groupCountZ);
+}
+
 void cmdResourceBarrier(Cmd* pCmd, uint32_t numBufferBarriers, BufferBarrier* pBufferBarriers, uint32_t numTextureBarriers,
                         TextureBarrier* pTextureBarriers, uint32_t numRtBarriers, RenderTargetBarrier* pRtBarriers)
 {
