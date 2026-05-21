@@ -186,6 +186,12 @@ f2x2 setRow(inout f2x2 M, in float2 row, const uint i) { M[i] = row; return M; }
 #define VS_MAIN main
 #define PS_MAIN main
 #define CS_MAIN main
+// BloomEngine M6.6 B.6: mesh + amplification shader entry points.
+// FSL stamps the entry-point name as MS_MAIN / AS_MAIN; this folds
+// them onto `main` so DXC's default entry-point resolution picks
+// them up without needing an explicit /E flag on the command line.
+#define MS_MAIN main
+#define AS_MAIN main
 #define TC_MAIN main
 #define TE_MAIN main
 

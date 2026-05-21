@@ -612,6 +612,11 @@ def collect_shader_decl(args, filepath: str, platforms, regen, dependencies, bin
             stage = Stages.GRAPH
         if line.startswith('#rootsig'):
             stage = Stages.ROOTSIG
+        # BloomEngine M6.6 B.6: mesh-shader stage directives.
+        if line.startswith('#mesh'):
+            stage = Stages.MESH
+        if line.startswith('#task'):
+            stage = Stages.TASK
         if stage is not Stages.NONE:
 
             binary = ShaderBinary()
