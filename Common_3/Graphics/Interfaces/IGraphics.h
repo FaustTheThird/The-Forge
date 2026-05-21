@@ -352,11 +352,11 @@ typedef enum ShaderStage
     // backends remap onto these two enum bits.
     SHADER_STAGE_MESH = 0x80,
     SHADER_STAGE_TASK = 0x100,
-#if defined(ENABLE_WORKGRAPH)
+    // SHADER_STAGE_COUNT is interpreted by the shader-binary loop as
+    // "max bit position + 1" (it iterates i = 0..COUNT-1 building
+    // stage_mask = 1 << i). TASK at 0x100 is bit 8, so COUNT = 9
+    // covers every stage including TASK regardless of ENABLE_WORKGRAPH.
     SHADER_STAGE_COUNT = 9,
-#else
-    SHADER_STAGE_COUNT = 8,
-#endif
 } ShaderStage;
 MAKE_ENUM_FLAG(uint32_t, ShaderStage)
 
@@ -1794,6 +1794,12 @@ typedef struct BinaryShaderDesc
     BinaryShaderStageDesc mHull;
     BinaryShaderStageDesc mDomain;
     BinaryShaderStageDesc mComp;
+    // BloomEngine M6.6 B.3: amplification (AS) + mesh (MS) shader binaries.
+    // Read when the shader's mStages bitmask carries SHADER_STAGE_TASK or
+    // SHADER_STAGE_MESH respectively. mTask is optional; some mesh PSOs
+    // are MS-only and skip amplification.
+    BinaryShaderStageDesc mTask;
+    BinaryShaderStageDesc mMesh;
     const ShaderConstant* pConstants;
     uint32_t              mConstantCount;
 #if defined(QUEST_VR)
@@ -1817,6 +1823,11 @@ typedef struct Shader
         struct IDxcBlobEncoding* pGSBlob;
         struct IDxcBlobEncoding* pPSBlob;
         struct IDxcBlobEncoding* pCSBlob;
+        // BloomEngine M6.6 B.3: amplification (AS) + mesh (MS) DXIL blobs.
+        // addMeshPipeline reads these into D3D12_SHADER_BYTECODE subobjects
+        // of the pipeline-state-stream desc.
+        struct IDxcBlobEncoding* pASBlob;
+        struct IDxcBlobEncoding* pMSBlob;
     } mDx;
 #endif
 #if defined(VULKAN)

@@ -4221,6 +4221,15 @@ void addShaderBinary(Renderer* pRenderer, const BinaryShaderDesc* pDesc, Shader*
                 pStage = &pDesc->mComp;
                 ppBlob = &pShaderProgram->mDx.pCSBlob;
                 break;
+            // BloomEngine M6.6 B.3: mesh-shader stages.
+            case SHADER_STAGE_TASK:
+                pStage = &pDesc->mTask;
+                ppBlob = &pShaderProgram->mDx.pASBlob;
+                break;
+            case SHADER_STAGE_MESH:
+                pStage = &pDesc->mMesh;
+                ppBlob = &pShaderProgram->mDx.pMSBlob;
+                break;
             default:
                 LOGF(eERROR, "Unknown shader stage %i", stage_mask);
                 continue;
@@ -4261,6 +4270,15 @@ void removeShader(Renderer* pRenderer, Shader* pShaderProgram)
     if (pShaderProgram->mDx.pCSBlob)
     {
         IDxcBlobEncoding_Release(pShaderProgram->mDx.pCSBlob);
+    }
+    // BloomEngine M6.6 B.3: mesh-shader blob cleanup.
+    if (pShaderProgram->mDx.pASBlob)
+    {
+        IDxcBlobEncoding_Release(pShaderProgram->mDx.pASBlob);
+    }
+    if (pShaderProgram->mDx.pMSBlob)
+    {
+        IDxcBlobEncoding_Release(pShaderProgram->mDx.pMSBlob);
     }
 
     SAFE_FREE(pShaderProgram);
@@ -5126,6 +5144,165 @@ static void addComputePipeline(Renderer* pRenderer, const PipelineDesc* pMainDes
 static void addWorkgraphPipeline(Renderer* pRenderer, const PipelineDesc* pMainDesc, Pipeline** ppPipeline);
 #endif
 
+// BloomEngine M6.6 B.3: D3D12 mesh-shader PSO creation. Mesh PSOs
+// cannot be expressed as a D3D12_GRAPHICS_PIPELINE_STATE_DESC -- they
+// must be built through the subobject-stream pipeline path
+// (CreatePipelineState on ID3D12Device2+). Each subobject in the
+// stream is a (D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, value) pair with
+// pointer-aligned natural layout; the runtime walks the stream by
+// reading the tag, sizing the payload from the tag, and advancing.
+//
+// The shader program must have been compiled with SHADER_STAGE_MESH;
+// SHADER_STAGE_TASK (amplification) is optional, SHADER_STAGE_FRAG
+// (pixel) is optional but typical. No vertex layout / topology
+// because mesh shaders generate verts in shader code.
+static void addMeshPipeline(Renderer* pRenderer, const PipelineDesc* pMainDesc, Pipeline** ppPipeline)
+{
+    ASSERT(pRenderer);
+    ASSERT(ppPipeline);
+    ASSERT(pMainDesc);
+
+    const MeshPipelineDesc* pDesc = &pMainDesc->mMeshDesc;
+
+    ASSERT(pDesc->pShaderProgram);
+    ASSERT(pRenderer->mDx.pGraphicsRootSignature);
+    ASSERT(pDesc->pShaderProgram->mStages & SHADER_STAGE_MESH);
+
+    Pipeline* pPipeline = (Pipeline*)tf_calloc_memalign(1, ALIGN_Pipeline, sizeof(Pipeline));
+    ASSERT(pPipeline);
+    pPipeline->mDx.mType = PIPELINE_TYPE_MESH;
+
+    const Shader* pShaderProgram = pDesc->pShaderProgram;
+
+    D3D12_SHADER_BYTECODE AS = { 0 };
+    D3D12_SHADER_BYTECODE MS = { 0 };
+    D3D12_SHADER_BYTECODE PS = { 0 };
+    if (pShaderProgram->mStages & SHADER_STAGE_TASK)
+    {
+        AS.BytecodeLength = IDxcBlobEncoding_GetBufferSize(pShaderProgram->mDx.pASBlob);
+        AS.pShaderBytecode = IDxcBlobEncoding_GetBufferPointer(pShaderProgram->mDx.pASBlob);
+    }
+    MS.BytecodeLength = IDxcBlobEncoding_GetBufferSize(pShaderProgram->mDx.pMSBlob);
+    MS.pShaderBytecode = IDxcBlobEncoding_GetBufferPointer(pShaderProgram->mDx.pMSBlob);
+    if (pShaderProgram->mStages & SHADER_STAGE_FRAG)
+    {
+        PS.BytecodeLength = IDxcBlobEncoding_GetBufferSize(pShaderProgram->mDx.pPSBlob);
+        PS.pShaderBytecode = IDxcBlobEncoding_GetBufferPointer(pShaderProgram->mDx.pPSBlob);
+    }
+
+    uint32_t render_target_count = min(pDesc->mRenderTargetCount, (uint32_t)MAX_RENDER_TARGET_ATTACHMENTS);
+    render_target_count = min(render_target_count, (uint32_t)D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
+
+    struct D3D12_RT_FORMAT_ARRAY rt_formats = { 0 };
+    rt_formats.NumRenderTargets = render_target_count;
+    for (uint32_t i = 0; i < render_target_count; ++i)
+    {
+        rt_formats.RTFormats[i] = (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(pDesc->pColorFormats[i]);
+    }
+
+    DXGI_SAMPLE_DESC sample_desc = {
+        .Count = (UINT)(pDesc->mSampleCount),
+        .Quality = (UINT)(pDesc->mSampleQuality),
+    };
+
+    D3D12_BLEND_DESC         blend_desc = pDesc->pBlendState ? util_to_blend_desc(pDesc->pBlendState) : gDefaultBlendDesc;
+    D3D12_RASTERIZER_DESC    rast_desc = pDesc->pRasterizerState ? util_to_rasterizer_desc(pDesc->pRasterizerState) : gDefaultRasterizerDesc;
+    D3D12_DEPTH_STENCIL_DESC ds_desc = pDesc->pDepthState ? util_to_depth_desc(pDesc->pDepthState) : gDefaultDepthDesc;
+    DXGI_FORMAT              dsv_format = (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(pDesc->mDepthStencilFormat);
+
+    // Subobject stream. Each pair is naturally pointer-aligned because
+    // every payload either is a pointer (8B), contains a pointer, or
+    // packs into <= 8B (UINT, DXGI_FORMAT) -- the C struct layout pads
+    // after the 4-byte D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag for us.
+    typedef struct
+    {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
+        ID3D12RootSignature*                Value;
+    } RootSigSubobject;
+    typedef struct
+    {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
+        D3D12_SHADER_BYTECODE               Value;
+    } BytecodeSubobject;
+    typedef struct
+    {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
+        D3D12_BLEND_DESC                    Value;
+    } BlendSubobject;
+    typedef struct
+    {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
+        D3D12_RASTERIZER_DESC               Value;
+    } RasterizerSubobject;
+    typedef struct
+    {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
+        D3D12_DEPTH_STENCIL_DESC            Value;
+    } DepthStencilSubobject;
+    typedef struct
+    {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
+        DXGI_FORMAT                         Value;
+    } DxgiFormatSubobject;
+    typedef struct
+    {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
+        struct D3D12_RT_FORMAT_ARRAY               Value;
+    } RtFormatsSubobject;
+    typedef struct
+    {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
+        DXGI_SAMPLE_DESC                    Value;
+    } SampleDescSubobject;
+    typedef struct
+    {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
+        UINT                                Value;
+    } UintSubobject;
+
+    struct
+    {
+        RootSigSubobject      RootSig;
+        BytecodeSubobject     AS;
+        BytecodeSubobject     MS;
+        BytecodeSubobject     PS;
+        BlendSubobject        Blend;
+        RasterizerSubobject   Rasterizer;
+        DepthStencilSubobject DepthStencil;
+        DxgiFormatSubobject   DsvFormat;
+        RtFormatsSubobject    RtFormats;
+        SampleDescSubobject   SampleDesc;
+        UintSubobject         SampleMask;
+        UintSubobject         NodeMask;
+    } stream = {
+        .RootSig = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, pRenderer->mDx.pGraphicsRootSignature },
+        .AS = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, AS },
+        .MS = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, MS },
+        .PS = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, PS },
+        .Blend = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend_desc },
+        .Rasterizer = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, rast_desc },
+        .DepthStencil = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, ds_desc },
+        .DsvFormat = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, dsv_format },
+        .RtFormats = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, rt_formats },
+        .SampleDesc = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, sample_desc },
+        .SampleMask = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT_MAX },
+        .NodeMask = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, util_calculate_shared_node_mask(pRenderer) },
+    };
+
+    D3D12_PIPELINE_STATE_STREAM_DESC stream_desc = {
+        .SizeInBytes = sizeof(stream),
+        .pPipelineStateSubobjectStream = &stream,
+    };
+    // CreatePipelineState lives on ID3D12Device2+. We follow the same
+    // cast-down pattern Forge uses for CreateStateObject on Device5
+    // (see hook_CreateStateObject) -- the underlying runtime device
+    // is always the highest-version interface; the cast is safe.
+    CHECK_HRESULT(COM_CALL(CreatePipelineState, (ID3D12Device2*)pRenderer->mDx.pDevice, &stream_desc,
+                           IID_ARGS(ID3D12PipelineState, &pPipeline->mDx.pPipelineState)));
+
+    *ppPipeline = pPipeline;
+}
+
 void addPipeline(Renderer* pRenderer, const PipelineDesc* pDesc, Pipeline** ppPipeline)
 {
     switch (pDesc->mType)
@@ -5138,6 +5315,11 @@ void addPipeline(Renderer* pRenderer, const PipelineDesc* pDesc, Pipeline** ppPi
     case PIPELINE_TYPE_GRAPHICS:
     {
         addGraphicsPipeline(pRenderer, pDesc, ppPipeline);
+        break;
+    }
+    case PIPELINE_TYPE_MESH:
+    {
+        addMeshPipeline(pRenderer, pDesc, ppPipeline);
         break;
     }
 #if defined(ENABLE_WORKGRAPH)
