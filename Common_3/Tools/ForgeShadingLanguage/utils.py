@@ -72,6 +72,14 @@ class Stages(Enum):
     GRAPH =   4
     ROOTSIG = 6
     NONE =    7
+    # FlowViewer M6.6 B.2: mesh-shader stages. TASK = amplification
+    # shader (HLSL `as`), MESH = mesh shader (HLSL `ms`). Values picked
+    # after NONE so existing code that switches on the enum doesn't
+    # need a "default" branch -- adding a new stage that the legacy
+    # path can't handle is the right failure mode (compile error if
+    # someone forgets to extend a switch).
+    TASK =    8
+    MESH =    9
 
 class Features(Enum):
     PRIM_ID = 0,
@@ -192,6 +200,10 @@ def get_stage_from_entry(line):
         Stages.VERT: 'VS_MAIN',
         Stages.FRAG: 'PS_MAIN',
         Stages.COMP: 'CS_MAIN',
+        # FlowViewer M6.6 B.2: mesh-shader entry-point detection.
+        # FSL files using mesh shaders must use these canonical names.
+        Stages.MESH: 'MS_MAIN',
+        Stages.TASK: 'AS_MAIN',
     }
 
     for stage, entry_name in stages.items():
