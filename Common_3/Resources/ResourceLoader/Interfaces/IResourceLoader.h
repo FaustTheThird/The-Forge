@@ -455,6 +455,13 @@ typedef struct ShaderLoadDesc
 #if defined(ENABLE_WORKGRAPH)
     ShaderStageLoadDesc mGraph;
 #endif
+    // BloomEngine M6.6 B.6: mesh-shader stages. mTask is the
+    // amplification shader (.task.fsl -> as_6_5); mMesh is the mesh
+    // shader (.mesh.fsl -> ms_6_5). Either may be empty -- MS-only
+    // pipelines skip mTask. The resource loader copies these binaries
+    // into Shader::mDx.pASBlob / pMSBlob exactly like the other stages.
+    ShaderStageLoadDesc mTask;
+    ShaderStageLoadDesc mMesh;
     const ShaderConstant* pConstants;
     uint32_t              mConstantCount;
 } ShaderLoadDesc;

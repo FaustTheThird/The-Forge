@@ -5210,95 +5210,32 @@ static void addMeshPipeline(Renderer* pRenderer, const PipelineDesc* pMainDesc, 
     D3D12_DEPTH_STENCIL_DESC ds_desc = pDesc->pDepthState ? util_to_depth_desc(pDesc->pDepthState) : gDefaultDepthDesc;
     DXGI_FORMAT              dsv_format = (DXGI_FORMAT)TinyImageFormat_ToDXGI_FORMAT(pDesc->mDepthStencilFormat);
 
-    // Subobject stream. Each pair is naturally pointer-aligned because
-    // every payload either is a pointer (8B), contains a pointer, or
-    // packs into <= 8B (UINT, DXGI_FORMAT) -- the C struct layout pads
-    // after the 4-byte D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag for us.
-    typedef struct
-    {
-        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
-        ID3D12RootSignature*                Value;
-    } RootSigSubobject;
-    typedef struct
-    {
-        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
-        D3D12_SHADER_BYTECODE               Value;
-    } BytecodeSubobject;
-    typedef struct
-    {
-        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
-        D3D12_BLEND_DESC                    Value;
-    } BlendSubobject;
-    typedef struct
-    {
-        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
-        D3D12_RASTERIZER_DESC               Value;
-    } RasterizerSubobject;
-    typedef struct
-    {
-        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
-        D3D12_DEPTH_STENCIL_DESC            Value;
-    } DepthStencilSubobject;
-    typedef struct
-    {
-        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
-        DXGI_FORMAT                         Value;
-    } DxgiFormatSubobject;
-    typedef struct
-    {
-        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
-        struct D3D12_RT_FORMAT_ARRAY               Value;
-    } RtFormatsSubobject;
-    typedef struct
-    {
-        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
-        DXGI_SAMPLE_DESC                    Value;
-    } SampleDescSubobject;
-    typedef struct
-    {
-        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type;
-        UINT                                Value;
-    } UintSubobject;
-
-    struct
-    {
-        RootSigSubobject      RootSig;
-        BytecodeSubobject     AS;
-        BytecodeSubobject     MS;
-        BytecodeSubobject     PS;
-        BlendSubobject        Blend;
-        RasterizerSubobject   Rasterizer;
-        DepthStencilSubobject DepthStencil;
-        DxgiFormatSubobject   DsvFormat;
-        RtFormatsSubobject    RtFormats;
-        SampleDescSubobject   SampleDesc;
-        UintSubobject         SampleMask;
-        UintSubobject         NodeMask;
-    } stream = {
-        .RootSig = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, pRenderer->mDx.pGraphicsRootSignature },
-        .AS = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, AS },
-        .MS = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, MS },
-        .PS = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, PS },
-        .Blend = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend_desc },
-        .Rasterizer = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, rast_desc },
-        .DepthStencil = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, ds_desc },
-        .DsvFormat = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, dsv_format },
-        .RtFormats = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, rt_formats },
-        .SampleDesc = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, sample_desc },
-        .SampleMask = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT_MAX },
-        .NodeMask = { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, util_calculate_shared_node_mask(pRenderer) },
-    };
-
-    D3D12_PIPELINE_STATE_STREAM_DESC stream_desc = {
-        .SizeInBytes = sizeof(stream),
-        .pPipelineStateSubobjectStream = &stream,
-    };
-    // CreatePipelineState lives on ID3D12Device2+. We follow the same
-    // cast-down pattern Forge uses for CreateStateObject on Device5
-    // (see hook_CreateStateObject) -- the underlying runtime device
-    // is always the highest-version interface; the cast is safe.
-    CHECK_HRESULT(COM_CALL(CreatePipelineState, (ID3D12Device2*)pRenderer->mDx.pDevice, &stream_desc,
-                           IID_ARGS(ID3D12PipelineState, &pPipeline->mDx.pPipelineState)));
+    // Defer the actual D3D12_PIPELINE_STATE_STREAM_DESC build to the
+    // C++ companion (Direct3D12_cxx.cpp). The runtime walks the stream
+    // assuming each subobject wrapper satisfies sizeof(W) % alignof(W)
+    // == 0, which is a C++ guarantee but NOT a C guarantee under MSVC
+    // -- C-mode _Alignas on a typedef'd struct doesn't enforce
+    // trailing pad, and the cursor walks onto zeroed bytes downstream
+    // (manifesting as "Duplicate Subobject Type: ROOT_SIGNATURE" the
+    // first time the runtime hits a zero 4B slot). The C++ shim uses
+    // alignas-on-class + standard template wrappers and gets it right.
+    HRESULT hr = Bloom_CreateMeshPipelineState(
+        pRenderer->mDx.pDevice,
+        pRenderer->mDx.pGraphicsRootSignature,
+        (pShaderProgram->mStages & SHADER_STAGE_TASK) ? &AS : NULL,
+        &MS,
+        (pShaderProgram->mStages & SHADER_STAGE_FRAG) ? &PS : NULL,
+        &blend_desc,
+        &rast_desc,
+        &ds_desc,
+        dsv_format,
+        rt_formats.RTFormats,
+        rt_formats.NumRenderTargets,
+        &sample_desc,
+        UINT_MAX,
+        util_calculate_shared_node_mask(pRenderer),
+        &pPipeline->mDx.pPipelineState);
+    CHECK_HRESULT(hr);
 
     *ppPipeline = pPipeline;
 }

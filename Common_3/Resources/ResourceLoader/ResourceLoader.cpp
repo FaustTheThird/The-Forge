@@ -4070,15 +4070,28 @@ void addShader(Renderer* pRenderer, const ShaderLoadDesc* pDesc, Shader** ppShad
 #define SHADER_STAGE_INDEX_GEOM      3
 #define SHADER_STAGE_INDEX_FRAG      4
 #define SHADER_STAGE_INDEX_COMP      5
+// BloomEngine M6.6 B.6: mesh-shader stage indices. WORKGRAPH stays at
+// 6 to preserve the existing layout when ENABLE_WORKGRAPH is defined;
+// TASK + MESH append after it so the dispatch order is stable.
 #define SHADER_STAGE_INDEX_WORKGRAPH 6
+#define SHADER_STAGE_INDEX_TASK      7
+#define SHADER_STAGE_INDEX_MESH      8
     const ShaderStageLoadDesc* stages[] = { &pDesc->mVert, &pDesc->mHull, &pDesc->mDomain, &pDesc->mGeom, &pDesc->mFrag, &pDesc->mComp,
 #if defined(ENABLE_WORKGRAPH)
-        &pDesc->mGraph
+        &pDesc->mGraph,
+#else
+        NULL,
 #endif
+        &pDesc->mTask, &pDesc->mMesh
     };
     uint32_t numThreadsPerGroup[3] = { 0, 0, 0 };
     for (uint32_t i = 0; i < TF_ARRAY_COUNT(stages); ++i)
     {
+        // BloomEngine M6.6 B.6: the WORKGRAPH slot is NULL when
+        // ENABLE_WORKGRAPH is not defined (preserves stable indices for
+        // TASK / MESH at 7 / 8). Skip the placeholder so we don't
+        // dereference NULL on non-workgraph builds.
+        if (!stages[i]) { continue; }
         const char* fileName = stages[i]->pFileName;
         if (!fileName || !*fileName)
         {
@@ -4119,6 +4132,15 @@ void addShader(Renderer* pRenderer, const ShaderLoadDesc* pDesc, Shader** ppShad
             pBinaryStageDesc = &binaryDesc.mComp;
             break;
 #endif
+        // BloomEngine M6.6 B.6: mesh-shader stages.
+        case SHADER_STAGE_INDEX_TASK:
+            stage = SHADER_STAGE_TASK;
+            pBinaryStageDesc = &binaryDesc.mTask;
+            break;
+        case SHADER_STAGE_INDEX_MESH:
+            stage = SHADER_STAGE_MESH;
+            pBinaryStageDesc = &binaryDesc.mMesh;
+            break;
         default:
             ASSERTMSG(false, "Unknown shader stage.");
             break;

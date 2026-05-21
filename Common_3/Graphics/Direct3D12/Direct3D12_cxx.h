@@ -68,6 +68,29 @@ typedef IDXGIAdapter4 D3D12MA_IDXGIAdapter;
     extern void PIX_EndEvent(ID3D12GraphicsCommandList1* context);
     extern void PIX_SetMarker(ID3D12GraphicsCommandList1* context, float r, float g, float b, const char* pName);
 
+    // BloomEngine M6.6 B.6: mesh-shader PSO creation via
+    // D3D12_PIPELINE_STATE_STREAM_DESC. Implemented in C++ to leverage
+    // alignas(void*) struct layout guarantees that MSVC C-mode does
+    // not honour (sizeof(struct) % alignof(struct) == 0 is a C++ rule,
+    // not C). The C-side addMeshPipeline assembles inputs and calls
+    // this; PSO ownership transfers to the caller via *ppOut.
+    extern HRESULT Bloom_CreateMeshPipelineState(
+        ID3D12Device*                   pDevice,
+        ID3D12RootSignature*            pRootSignature,
+        const D3D12_SHADER_BYTECODE*    pAS,        // optional, may be NULL
+        const D3D12_SHADER_BYTECODE*    pMS,        // required
+        const D3D12_SHADER_BYTECODE*    pPS,        // optional, may be NULL
+        const D3D12_BLEND_DESC*         pBlend,
+        const D3D12_RASTERIZER_DESC*    pRasterizer,
+        const D3D12_DEPTH_STENCIL_DESC* pDepthStencil,
+        DXGI_FORMAT                     dsvFormat,
+        const DXGI_FORMAT*              pRtvFormats,
+        UINT                            numRtvFormats,
+        const DXGI_SAMPLE_DESC*         pSampleDesc,
+        UINT                            sampleMask,
+        UINT                            nodeMask,
+        ID3D12PipelineState**           ppOut);
+
 #ifdef __cplusplus
 }
 #endif

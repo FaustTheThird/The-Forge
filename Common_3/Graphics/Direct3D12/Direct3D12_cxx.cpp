@@ -176,4 +176,111 @@ extern "C" void D3D12MA_BuildStatsString(struct D3D12MAAllocator_* pAllocator, B
 {
     ((D3D12MAAllocator*)pAllocator)->BuildStatsString(detailedMap);
 }
+
+// =====================================================================
+// BloomEngine M6.6 B.6: mesh-shader PSO creation via stream-desc.
+//
+// Mirrors d3dx12_pipeline_state_stream.h's `CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT`
+// pattern -- one templated wrapper that pairs a subobject-type tag with
+// the payload, then `alignas(void*)` on the class lets C++'s sizeof%
+// alignof==0 rule do the trailing-pad work the D3D12 runtime expects
+// when walking the stream. The whole reason this lives here and not
+// in Direct3D12.c is that MSVC C-mode does NOT enforce
+// sizeof(struct) % alignof(struct) == 0 for typedef'd alignas-d
+// structs, which corrupts the cursor walk inside CreatePipelineState
+// (manifesting as "Duplicate Subobject Type detected: ROOT_SIGNATURE").
+// =====================================================================
+
+// File-scope helpers. Anonymous namespaces are banned by Bloom style
+// (no internal-linkage namespacing), so names get a BloomPss_ prefix
+// to avoid collisions inside unity-style builds.
+template <typename InnerStructType, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE TypeTag>
+class alignas(void*) BloomPss_Subobject
+{
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE m_type;
+    InnerStructType                     m_inner;
+public:
+    BloomPss_Subobject() noexcept : m_type(TypeTag), m_inner{} {}
+    BloomPss_Subobject(const InnerStructType& v) noexcept : m_type(TypeTag), m_inner(v) {}
+    InnerStructType& operator=(const InnerStructType& v) noexcept { m_inner = v; return m_inner; }
+};
+
+using BloomPss_RootSig    = BloomPss_Subobject<ID3D12RootSignature*,    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE>;
+using BloomPss_AS         = BloomPss_Subobject<D3D12_SHADER_BYTECODE,   D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS>;
+using BloomPss_MS         = BloomPss_Subobject<D3D12_SHADER_BYTECODE,   D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS>;
+using BloomPss_PS         = BloomPss_Subobject<D3D12_SHADER_BYTECODE,   D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS>;
+using BloomPss_Blend      = BloomPss_Subobject<D3D12_BLEND_DESC,        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND>;
+using BloomPss_Rast       = BloomPss_Subobject<D3D12_RASTERIZER_DESC,   D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER>;
+using BloomPss_Depth      = BloomPss_Subobject<D3D12_DEPTH_STENCIL_DESC,D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL>;
+using BloomPss_DsvFormat  = BloomPss_Subobject<DXGI_FORMAT,             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT>;
+using BloomPss_RtFormats  = BloomPss_Subobject<D3D12_RT_FORMAT_ARRAY,   D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS>;
+using BloomPss_SampleDesc = BloomPss_Subobject<DXGI_SAMPLE_DESC,        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC>;
+using BloomPss_SampleMask = BloomPss_Subobject<UINT,                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK>;
+using BloomPss_NodeMask   = BloomPss_Subobject<UINT,                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK>;
+
+// The stream itself. Subobject order doesn't matter to the runtime --
+// only that each appears exactly once.
+struct alignas(void*) BloomMeshPipelineStream
+{
+    BloomPss_RootSig    RootSig;
+    BloomPss_AS         AS;
+    BloomPss_MS         MS;
+    BloomPss_PS         PS;
+    BloomPss_Blend      Blend;
+    BloomPss_Rast       Rasterizer;
+    BloomPss_Depth      DepthStencil;
+    BloomPss_DsvFormat  DsvFormat;
+    BloomPss_RtFormats  RtFormats;
+    BloomPss_SampleDesc SampleDesc;
+    BloomPss_SampleMask SampleMask;
+    BloomPss_NodeMask   NodeMask;
+};
+
+extern "C" HRESULT Bloom_CreateMeshPipelineState(
+    ID3D12Device*                   pDevice,
+    ID3D12RootSignature*            pRootSignature,
+    const D3D12_SHADER_BYTECODE*    pAS,
+    const D3D12_SHADER_BYTECODE*    pMS,
+    const D3D12_SHADER_BYTECODE*    pPS,
+    const D3D12_BLEND_DESC*         pBlend,
+    const D3D12_RASTERIZER_DESC*    pRasterizer,
+    const D3D12_DEPTH_STENCIL_DESC* pDepthStencil,
+    DXGI_FORMAT                     dsvFormat,
+    const DXGI_FORMAT*              pRtvFormats,
+    UINT                            numRtvFormats,
+    const DXGI_SAMPLE_DESC*         pSampleDesc,
+    UINT                            sampleMask,
+    UINT                            nodeMask,
+    ID3D12PipelineState**           ppOut)
+{
+    if (!pDevice || !pRootSignature || !pMS || !ppOut) { return E_INVALIDARG; }
+
+    BloomMeshPipelineStream s{};
+    s.RootSig      = pRootSignature;
+    if (pAS) { s.AS = *pAS; }
+    s.MS           = *pMS;
+    if (pPS) { s.PS = *pPS; }
+    s.Blend        = *pBlend;
+    s.Rasterizer   = *pRasterizer;
+    s.DepthStencil = *pDepthStencil;
+    s.DsvFormat    = dsvFormat;
+
+    D3D12_RT_FORMAT_ARRAY rtArr{};
+    rtArr.NumRenderTargets = numRtvFormats;
+    for (UINT i = 0; i < numRtvFormats && i < 8; ++i) { rtArr.RTFormats[i] = pRtvFormats[i]; }
+    s.RtFormats = rtArr;
+
+    s.SampleDesc = *pSampleDesc;
+    s.SampleMask = sampleMask;
+    s.NodeMask   = nodeMask;
+
+    // CreatePipelineState is on ID3D12Device2+. Cast follows the same
+    // pattern Forge uses for ID3D12Device5 in hook_CreateStateObject --
+    // the runtime device is always the highest-version interface.
+    ID3D12Device2*                   pDevice2 = reinterpret_cast<ID3D12Device2*>(pDevice);
+    D3D12_PIPELINE_STATE_STREAM_DESC desc{};
+    desc.SizeInBytes                    = sizeof(s);
+    desc.pPipelineStateSubobjectStream = &s;
+    return pDevice2->CreatePipelineState(&desc, IID_PPV_ARGS(ppOut));
+}
 #endif
