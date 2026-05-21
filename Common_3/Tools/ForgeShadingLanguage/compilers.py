@@ -96,7 +96,7 @@ def util_shadertarget_dx(stage, features):
         level_dx = max(level_dx, '_6_8')
     if stage is Stages.ROOTSIG:
         level_dx = '_1_1'
-    # FlowViewer M6.6 B.2: mesh-shader stages require SM 6.5 minimum
+    # BloomEngine M6.6 B.2: mesh-shader stages require SM 6.5 minimum
     # (D3D12 mesh-shader pipeline was added in SM 6.5; the wave-intrinsics
     # extensions in 6.6/6.8 are nice-to-have but not required).
     if stage is Stages.MESH or stage is Stages.TASK:
@@ -108,7 +108,7 @@ def util_shadertarget_dx(stage, features):
         Stages.GEOM: 'gs',
         Stages.GRAPH: 'lib',
         Stages.ROOTSIG: 'rootsig',
-        # FlowViewer M6.6 B.2: DXC profile strings for mesh-shader stages.
+        # BloomEngine M6.6 B.2: DXC profile strings for mesh-shader stages.
         # MESH -> ms_6_5 (mesh shader), TASK -> as_6_5 (amplification).
         Stages.MESH: 'ms',
         Stages.TASK: 'as',

@@ -344,7 +344,7 @@ typedef enum ShaderStage
 #if defined(ENABLE_WORKGRAPH)
     SHADER_STAGE_WORKGRAPH = 0x40,
 #endif
-    // FlowViewer M6.6 Phase B: mesh-shader stages. 0x80 / 0x100 skip the
+    // BloomEngine M6.6 Phase B: mesh-shader stages. 0x80 / 0x100 skip the
     // 0x40 slot held by SHADER_STAGE_WORKGRAPH so mesh + workgraph builds
     // can coexist (Forge has no enforced "one optional feature per build"
     // rule). HLSL semantics: AS = D3D12 amplification shader, MS = mesh
@@ -360,7 +360,7 @@ typedef enum ShaderStage
 } ShaderStage;
 MAKE_ENUM_FLAG(uint32_t, ShaderStage)
 
-// FlowViewer M6.6 Phase B: lock the mesh-shader bit assignments at
+// BloomEngine M6.6 Phase B: lock the mesh-shader bit assignments at
 // compile-time. If anyone re-packs the ShaderStage enum and accidentally
 // aliases MESH/TASK onto an existing bit, this fires instead of producing
 // a silent miscompile in the PSO descriptor packing path.
@@ -535,7 +535,7 @@ typedef enum PipelineType
     PIPELINE_TYPE_UNDEFINED = 0,
     PIPELINE_TYPE_COMPUTE,
     PIPELINE_TYPE_GRAPHICS,
-    // FlowViewer M6.6 Phase B: mesh-shader PSOs. Built through the D3D12
+    // BloomEngine M6.6 Phase B: mesh-shader PSOs. Built through the D3D12
     // pipeline-state-stream-desc path (cmdDispatchMesh requires this --
     // legacy D3D12_GRAPHICS_PIPELINE_STATE_DESC can't represent AS/MS).
     // Total enum values now fit in the 3-bit mPipelineType field in
@@ -2040,7 +2040,7 @@ typedef struct WorkgraphPipelineDesc
 } WorkgraphPipelineDesc;
 #endif
 
-// FlowViewer M6.6 Phase B: mesh-shader PSO description. Mirrors
+// BloomEngine M6.6 Phase B: mesh-shader PSO description. Mirrors
 // GraphicsPipelineDesc minus the input-assembler bits (VertexLayout /
 // PrimitiveTopology) -- mesh shaders generate verts in shader code, so
 // there is no IA stage. pShaderProgram must have been compiled with
