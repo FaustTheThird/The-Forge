@@ -427,6 +427,27 @@ def getShader(platform: Platforms, binary: ShaderBinary, fsl: list, dst=None, li
     for i, arg in enumerate(entry_args):
 
         arg_elements = arg.split()
+
+        # BloomEngine M6.6 D.1: mesh-shader entry args carry multi-
+        # token qualifiers that the FSL emitter must pass through to
+        # HLSL verbatim. Recognise the four canonical mesh-shader
+        # signatures and skip the regular flat/struct classification
+        # (the downstream `_MAIN(` text-replace in d3d.py does nothing
+        # for these since neither flat_args nor struct_args holds them):
+        #   out vertices T Name[N]    -- MS vertex output array
+        #   out indices  uint3 Name[N] -- MS triangle output array
+        #   out primitives T Name[N]  -- MS primitive output array
+        #   in  payload  T Name        -- MS payload input (matches
+        #                                 the AS's DispatchMesh payload)
+        if stage in (Stages.MESH, Stages.TASK):
+            if len(arg_elements) >= 4:
+                head = arg_elements[0].lower(), arg_elements[1].lower()
+                if head in (('out', 'vertices'),
+                            ('out', 'indices'),
+                            ('out', 'primitives'),
+                            ('in',  'payload')):
+                    continue
+
         fsl_assert(len(arg_elements) == 2, fsl_path, message=': error FSL: Invalid entry argument: \''+arg+'\'')
         arg_dtype, arg_var = arg_elements
 
