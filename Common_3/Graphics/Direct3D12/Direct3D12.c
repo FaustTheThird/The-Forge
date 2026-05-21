@@ -5620,10 +5620,30 @@ void cmdBindPipeline(Cmd* pCmd, Pipeline* pPipeline)
     // bind given pipeline
     ASSERT(pCmd->mDx.pCmdList);
 
-    if (pPipeline->mDx.mType == PIPELINE_TYPE_GRAPHICS)
+    if (pPipeline->mDx.mType == PIPELINE_TYPE_GRAPHICS || pPipeline->mDx.mType == PIPELINE_TYPE_MESH)
     {
         ASSERT(pPipeline->mDx.pPipelineState);
-        hook_IASetPrimitiveTopology(pCmd->mDx.pCmdList, pPipeline->mDx.mPrimitiveTopology);
+        // BloomEngine M6.6 D.3.b: mesh-shader pipelines share the
+        // graphics root signature + command-list state but the IA
+        // topology in their PSO is implicitly bypassed (the MS's
+        // [outputtopology] attribute drives the rasterizer). The
+        // command list still needs IASetPrimitiveTopology set to
+        // something non-undefined or every triangle the MS emits
+        // gets discarded at the rasterizer. Default mesh dispatches
+        // to TRIANGLELIST -- matches `[outputtopology("triangle")]`,
+        // which is the only topology DirectX 12 mesh shaders accept
+        // today.
+        //
+        // Also critical: mPipelineType MUST stay GRAPHICS so the
+        // subsequent cmdBindDescriptorSet calls route through
+        // SetGraphicsRootDescriptorTable. Without this, descriptors
+        // bind to the compute root and PIX shows all graphics tables
+        // as <not bound>.
+        const D3D_PRIMITIVE_TOPOLOGY Topo =
+            (pPipeline->mDx.mType == PIPELINE_TYPE_MESH)
+                ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+                : pPipeline->mDx.mPrimitiveTopology;
+        hook_IASetPrimitiveTopology(pCmd->mDx.pCmdList, Topo);
         hook_SetPipelineState(pCmd->mDx.pCmdList, pPipeline->mDx.pPipelineState);
         pCmd->mDx.mPipelineType = PIPELINE_TYPE_GRAPHICS;
     }
