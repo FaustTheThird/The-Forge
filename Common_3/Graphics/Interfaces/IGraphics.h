@@ -343,12 +343,32 @@ typedef enum ShaderStage
     SHADER_STAGE_DOMN = SHADER_STAGE_TESE,
 #if defined(ENABLE_WORKGRAPH)
     SHADER_STAGE_WORKGRAPH = 0x40,
-    SHADER_STAGE_COUNT = 7,
+#endif
+    // FlowViewer M6.6 Phase B: mesh-shader stages. 0x80 / 0x100 skip the
+    // 0x40 slot held by SHADER_STAGE_WORKGRAPH so mesh + workgraph builds
+    // can coexist (Forge has no enforced "one optional feature per build"
+    // rule). HLSL semantics: AS = D3D12 amplification shader, MS = mesh
+    // shader. Vulkan calls them Task/Mesh; Metal Object/Mesh -- the
+    // backends remap onto these two enum bits.
+    SHADER_STAGE_MESH = 0x80,
+    SHADER_STAGE_TASK = 0x100,
+#if defined(ENABLE_WORKGRAPH)
+    SHADER_STAGE_COUNT = 9,
 #else
-    SHADER_STAGE_COUNT = 6,
+    SHADER_STAGE_COUNT = 8,
 #endif
 } ShaderStage;
 MAKE_ENUM_FLAG(uint32_t, ShaderStage)
+
+// FlowViewer M6.6 Phase B: lock the mesh-shader bit assignments at
+// compile-time. If anyone re-packs the ShaderStage enum and accidentally
+// aliases MESH/TASK onto an existing bit, this fires instead of producing
+// a silent miscompile in the PSO descriptor packing path.
+COMPILE_ASSERT(SHADER_STAGE_MESH == 0x80);
+COMPILE_ASSERT(SHADER_STAGE_TASK == 0x100);
+COMPILE_ASSERT((SHADER_STAGE_MESH & SHADER_STAGE_ALL_GRAPHICS) == 0);
+COMPILE_ASSERT((SHADER_STAGE_TASK & SHADER_STAGE_ALL_GRAPHICS) == 0);
+COMPILE_ASSERT((SHADER_STAGE_MESH & SHADER_STAGE_TASK) == 0);
 
 typedef enum TextureDimension
 {
@@ -515,11 +535,18 @@ typedef enum PipelineType
     PIPELINE_TYPE_UNDEFINED = 0,
     PIPELINE_TYPE_COMPUTE,
     PIPELINE_TYPE_GRAPHICS,
+    // FlowViewer M6.6 Phase B: mesh-shader PSOs. Built through the D3D12
+    // pipeline-state-stream-desc path (cmdDispatchMesh requires this --
+    // legacy D3D12_GRAPHICS_PIPELINE_STATE_DESC can't represent AS/MS).
+    // Total enum values now fit in the 3-bit mPipelineType field in
+    // RootSignature / DescriptorSet (max 7, we have at most 5 here).
+    PIPELINE_TYPE_MESH,
 #if defined(ENABLE_WORKGRAPH)
     PIPELINE_TYPE_WORKGRAPH,
 #endif
     PIPELINE_TYPE_COUNT,
 } PipelineType;
+COMPILE_ASSERT(PIPELINE_TYPE_COUNT <= 8);  // 3-bit mPipelineType bit-field
 
 typedef enum FilterType
 {
@@ -2013,12 +2040,39 @@ typedef struct WorkgraphPipelineDesc
 } WorkgraphPipelineDesc;
 #endif
 
+// FlowViewer M6.6 Phase B: mesh-shader PSO description. Mirrors
+// GraphicsPipelineDesc minus the input-assembler bits (VertexLayout /
+// PrimitiveTopology) -- mesh shaders generate verts in shader code, so
+// there is no IA stage. pShaderProgram must have been compiled with
+// SHADER_STAGE_MESH (optionally + SHADER_STAGE_TASK if amplification
+// is used). All other rasteriser / blend / depth / RT-format fields
+// behave exactly like GraphicsPipelineDesc.
+typedef struct MeshPipelineDesc
+{
+    Shader*              pShaderProgram;
+    BlendStateDesc*      pBlendState;
+    DepthStateDesc*      pDepthState;
+    RasterizerStateDesc* pRasterizerState;
+    TinyImageFormat*     pColorFormats;
+#if defined(USE_MSAA_RESOLVE_ATTACHMENTS)
+    StoreActionType* pColorResolveActions;
+#endif
+    uint32_t        mRenderTargetCount;
+    SampleCount     mSampleCount;
+    uint32_t        mSampleQuality;
+    TinyImageFormat mDepthStencilFormat;
+    bool            mSupportIndirectCommandBuffer;
+    bool            mVRFoveatedRendering;
+    bool            mUseCustomSampleLocations;
+} MeshPipelineDesc;
+
 typedef struct PipelineDesc
 {
     union
     {
         ComputePipelineDesc  mComputeDesc;
         GraphicsPipelineDesc mGraphicsDesc;
+        MeshPipelineDesc     mMeshDesc;
 #if defined(ENABLE_WORKGRAPH)
         WorkgraphPipelineDesc mWorkgraphDesc;
 #endif
