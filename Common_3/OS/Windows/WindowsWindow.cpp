@@ -939,9 +939,19 @@ static HCURSOR gCurrentCursor = NULL;
 
 void* createCursor(const char* path) { return LoadCursorFromFileA(path); }
 
-// BloomEngine: a standard system cursor by kind (0 = arrow, 1 = I-beam). createCursor only loads from a
-// file, so the custom UI needs this to request a system I-beam without shipping a .cur asset.
-void* getStandardCursor(uint32_t kind) { return LoadCursor(NULL, kind == 1u ? IDC_IBEAM : IDC_ARROW); }
+// BloomEngine: a standard system cursor by kind (0 = arrow, 1 = I-beam, 2 = horizontal resize). createCursor
+// only loads from a file, so the custom UI needs this to request system cursors without shipping .cur assets.
+void* getStandardCursor(uint32_t kind)
+{
+    LPCSTR id = IDC_ARROW;
+    switch (kind)
+    {
+    case 1u: id = IDC_IBEAM; break;
+    case 2u: id = IDC_SIZEWE; break;
+    default: id = IDC_ARROW; break;
+    }
+    return LoadCursor(NULL, id);
+}
 
 void setCursor(void* cursor)
 {
