@@ -933,12 +933,20 @@ void centerWindow(WindowDesc* winDesc)
 // CURSOR AND MOUSE HANDLING INTERFACE FUNCTIONS
 //------------------------------------------------------------------------
 
+// BloomEngine: the app's current requested cursor. WM_SETCURSOR re-applies it on every move so a custom
+// cursor (e.g. the UI's I-beam) sticks instead of being reset to the arrow by the default handling.
+static HCURSOR gCurrentCursor = NULL;
+
 void* createCursor(const char* path) { return LoadCursorFromFileA(path); }
+
+// BloomEngine: a standard system cursor by kind (0 = arrow, 1 = I-beam). createCursor only loads from a
+// file, so the custom UI needs this to request a system I-beam without shipping a .cur asset.
+void* getStandardCursor(uint32_t kind) { return LoadCursor(NULL, kind == 1u ? IDC_IBEAM : IDC_ARROW); }
 
 void setCursor(void* cursor)
 {
-    HCURSOR windowsCursor = (HCURSOR)cursor;
-    SetCursor(windowsCursor);
+    gCurrentCursor = (HCURSOR)cursor;
+    SetCursor(gCurrentCursor);
 }
 
 void showCursor()
@@ -1304,13 +1312,12 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         if (LOWORD(lParam) == HTCLIENT)
         {
-            if (!gCursorInsideRectangle)
-            {
-                HCURSOR cursor = LoadCursor(NULL, IDC_ARROW);
-                SetCursor(cursor);
-
-                gCursorInsideRectangle = true;
-            }
+            // BloomEngine: apply the app-requested cursor (setCursor -> gCurrentCursor) instead of forcing
+            // the arrow, so custom-UI widgets can show an I-beam. Re-applied each move; return TRUE so
+            // DefWindowProc doesn't override it with the window-class cursor.
+            SetCursor(gCurrentCursor ? gCurrentCursor : LoadCursor(NULL, IDC_ARROW));
+            gCursorInsideRectangle = true;
+            return TRUE;
         }
         else
         {

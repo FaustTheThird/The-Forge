@@ -2387,7 +2387,9 @@ UIWidget* uiAddComponentWidget(UIComponent* pGui, const char* pLabel, const void
     UIWidget* pBaseWidget = (UIWidget*)tf_calloc(1, sizeof(UIWidget));
     pBaseWidget->mType = type;
     pBaseWidget->pWidget = (void*)pWidget;
-    strcpy(pBaseWidget->mLabel, pLabel);
+    // Bounded copy: mLabel is a fixed char[MAX_LABEL_STR_LENGTH]; an over-long label here previously ran an
+    // unbounded strcpy past the allocation and corrupted the heap (mmgr postfix-guard assert).
+    snprintf(pBaseWidget->mLabel, MAX_LABEL_STR_LENGTH, "%s", pLabel);
 
     arrpush(pGui->mWidgets, clone ? cloneWidget(pBaseWidget) : pBaseWidget);
     arrpush(pGui->mWidgetsClone, clone);
@@ -2635,6 +2637,12 @@ void platformExitUserInterface()
 #endif
 }
 
+// BloomEngine: id of the full-viewport dock space hosted each frame when docking is enabled. Exposed via
+// uiMainDockSpaceID() so the app can author a default panel layout (DockBuilder) into it.
+static ImGuiID gBloomMainDockSpaceId = 0;
+
+uint32_t uiMainDockSpaceID() { return (uint32_t)gBloomMainDockSpaceId; }
+
 void platformUpdateUserInterface(float deltaTime)
 {
 #ifdef ENABLE_FORGE_UI
@@ -2724,6 +2732,11 @@ void platformUpdateUserInterface(float deltaTime)
     guiUpdate.showDemoWindow = pUserInterface->mShowDemoUiWindow;
 
     uiNewFrame();
+
+    // BloomEngine: when docking is enabled, host a full-viewport pass-through dock space so editor panels
+    // snap to the window edges around a transparent central node (the 3D scene shows through it).
+    if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_DockingEnable)
+        gBloomMainDockSpaceId = ImGui::DockSpaceOverViewport(NULL, ImGuiDockNodeFlags_PassthruCentralNode);
 
     if (pUserInterface->mActive)
     {

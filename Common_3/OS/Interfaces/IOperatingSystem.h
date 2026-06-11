@@ -337,6 +337,7 @@ extern "C"
 
     // Mouse and cursor handling
     FORGE_API void* createCursor(const char* path);
+    FORGE_API void* getStandardCursor(uint32_t kind);  // BloomEngine: 0 = arrow, 1 = I-beam (path-free)
     FORGE_API void  setCursor(void* cursor);
     FORGE_API void  showCursor(void);
     FORGE_API void  hideCursor(void);

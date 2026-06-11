@@ -494,6 +494,10 @@ typedef struct UserInterfaceLoadDesc
 /// To be called at application initialization time by the App Layer
 FORGE_API void initUserInterface(UserInterfaceDesc* pDesc);
 
+/// BloomEngine: id of the full-viewport dock space hosted each frame when UserInterfaceDesc::mEnableDocking
+/// is set. 0 until the first frame draws. Pass to ImGui's DockBuilder* to author a default panel layout.
+FORGE_API uint32_t uiMainDockSpaceID();
+
 /// Frees Forge Rendering objects and memory associated with the User Interface
 /// To be called at application shutdown time by the App Layer
 FORGE_API void exitUserInterface();
