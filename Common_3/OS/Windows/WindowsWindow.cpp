@@ -567,6 +567,13 @@ static void onFocusChanged(WindowDesc* wnd, bool focused)
     pWindowAppRef->mSettings.mFocused = focused;
 }
 
+// BloomEngine: does the MAIN window currently hold OS keyboard focus? The render-side UI reads this so it can
+// release its text-edit focus (stop its caret) when the app is backgrounded or a tool window took focus.
+bool isMainWindowFocused()
+{
+    return pWindowAppRef != nullptr && pWindowAppRef->mSettings.mFocused;
+}
+
 // Hit test the frame for resizing and moving.
 static LRESULT HitTestNCA(HWND hWnd, WPARAM /*wParam*/, LPARAM lParam)
 {
@@ -978,8 +985,48 @@ void* getStandardCursor(uint32_t kind)
 
 void setCursor(void* cursor)
 {
+    // Store-only: WM_SETCURSOR (pump thread) re-applies gCurrentCursor on the next move. We deliberately do
+    // NOT call Win32 SetCursor here — doing so from the render thread every frame stomped a hovered tool
+    // window's own per-window cursor (set in its WM_SETCURSOR), which showed up as cursor flicker.
     gCurrentCursor = (HCURSOR)cursor;
-    SetCursor(gCurrentCursor);
+}
+
+// Maps a bloom::UiCursor value (carried as a raw byte so the Domain enum stays out of this OS header) to a
+// Win32 system cursor. The index order MUST track Domain/UiTypes.h UiCursor. Handles load once and are shared
+// (LoadCursor(NULL, IDC_*) returns non-freeable system handles).
+static HCURSOR ShapeToHCursor(unsigned char shape)
+{
+    static HCURSOR Table[8] = {};
+    static bool    Loaded = false;
+    if (!Loaded)
+    {
+        Table[0] = LoadCursor(NULL, IDC_ARROW);     // UiCursor::Default
+        Table[1] = LoadCursor(NULL, IDC_HAND);      // UiCursor::Pointer
+        Table[2] = LoadCursor(NULL, IDC_IBEAM);     // UiCursor::Text
+        Table[3] = LoadCursor(NULL, IDC_SIZEWE);    // UiCursor::ResizeEW
+        Table[4] = LoadCursor(NULL, IDC_SIZENS);    // UiCursor::ResizeNS
+        Table[5] = LoadCursor(NULL, IDC_SIZENWSE);  // UiCursor::ResizeNWSE
+        Table[6] = LoadCursor(NULL, IDC_SIZENESW);  // UiCursor::ResizeNESW
+        Table[7] = LoadCursor(NULL, IDC_HAND);      // UiCursor::Hand
+        Loaded = true;
+    }
+    if (shape >= 8)
+    {
+        shape = 0;
+    }
+    return Table[shape] ? Table[shape] : Table[0];
+}
+
+void setWindowCursor(WindowDesc* winDesc, unsigned char shape)
+{
+    if (winDesc == nullptr)
+    {
+        return;
+    }
+    // Store-only: WM_SETCURSOR (pump thread) reads this and applies the HCURSOR for THIS window. We do NOT
+    // call Win32 SetCursor here — the render thread isn't necessarily the foreground window's message thread,
+    // and applying eagerly would race/stomp another window's cursor.
+    winDesc->input.CursorShape = shape;
 }
 
 void showCursor()
@@ -1037,6 +1084,7 @@ void captureCursor(WindowDesc* winDesc, bool bEnable)
             SetRect(&clientRect, ptClientUL.x, ptClientUL.y, ptClientLR.x, ptClientLR.y);
             ClipCursor(&clientRect);
             ShowCursor(FALSE);
+            winDesc->input.CursorHidden = true;  // WM_SETCURSOR keeps the per-window cursor hidden during look
         }
         else
         {
@@ -1044,6 +1092,7 @@ void captureCursor(WindowDesc* winDesc, bool bEnable)
             ShowCursor(TRUE);
             ReleaseCapture();
             SetCursorPos(lastCursorPosX, lastCursorPosY);
+            winDesc->input.CursorHidden = false;
         }
 
         winDesc->cursorCaptured = bEnable;
@@ -1222,6 +1271,57 @@ static void BloomForwardInputToEngine(HWND hwnd, UINT message, WPARAM wParam, LP
     platformInputEvent(&msg);
 }
 
+// Maps a Win32 virtual-key to a bloom UiKey bit (1u << UiKey value), or 0 if the key isn't in the UI keymap.
+// The bit values MUST track Domain/UiTypes.h UiKey — this is the fork's copy of that enum's layout.
+static unsigned int BloomUiKeyBit(WPARAM vk)
+{
+    switch (vk)
+    {
+    case VK_TAB:     return 1u << 0;   // Tab
+    case VK_SHIFT:   return 1u << 1;   // Shift
+    case VK_CONTROL: return 1u << 2;   // Ctrl
+    case VK_LEFT:    return 1u << 3;   // Left
+    case VK_RIGHT:   return 1u << 4;   // Right
+    case VK_HOME:    return 1u << 5;   // Home
+    case VK_END:     return 1u << 6;   // End
+    case VK_BACK:    return 1u << 7;   // Backspace
+    case VK_DELETE:  return 1u << 8;   // Delete
+    case VK_RETURN:  return 1u << 9;   // Enter
+    case VK_ESCAPE:  return 1u << 10;  // Escape
+    case 'A':        return 1u << 11;
+    case 'C':        return 1u << 12;
+    case 'V':        return 1u << 13;
+    case 'X':        return 1u << 14;
+    case 'Z':        return 1u << 15;
+    case 'Y':        return 1u << 16;
+    case 'W':        return 1u << 17;
+    case 'E':        return 1u << 18;
+    case 'R':        return 1u << 19;
+    case VK_SPACE:   return 1u << 20;  // Space
+    case VK_MENU:    return 1u << 21;  // Alt
+    case VK_UP:      return 1u << 22;  // Up
+    case VK_DOWN:    return 1u << 23;  // Down
+    default:         return 0u;
+    }
+}
+
+// Maps a Win32 virtual-key to a game-movement NavKey bit, or 0. Own layout (bit0 W,1 A,2 S,3 D,4 E,5 Q,6 Shift)
+// because UiKey omits S/D/Q; the camera reads these, the UI keymap never sees them.
+static unsigned int BloomNavKeyBit(WPARAM vk)
+{
+    switch (vk)
+    {
+    case 'W':      return 1u << 0;
+    case 'A':      return 1u << 1;
+    case 'S':      return 1u << 2;
+    case 'D':      return 1u << 3;
+    case 'E':      return 1u << 4;
+    case 'Q':      return 1u << 5;
+    case VK_SHIFT: return 1u << 6;
+    default:       return 0u;
+    }
+}
+
 // Window event handler - Use as less as possible
 LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
@@ -1351,17 +1451,63 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_SETFOCUS:
     {
         onFocusChanged(w, true);
+        w->input.HasFocus = true;
+        InterlockedIncrement(&w->input.Generation);
         break;
     }
     case WM_KILLFOCUS:
     {
         onFocusChanged(w, false);
-        if (w != gWindow)
+        // Drop every held input on focus loss (any window): no phantom mouse-drag, no key stuck down feeding
+        // the camera or a text field when focus returns. The main window's state is unread until later stages
+        // migrate onto it, so clearing it now is purely additive.
+        w->input.HasFocus      = false;
+        w->input.Buttons       = 0u;
+        w->input.Keys          = 0u;
+        w->input.NavKeys       = 0u;
+        w->input.TextCharCount = 0u;
+        InterlockedIncrement(&w->input.Generation);
+        break;
+    }
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+    {
+        w->input.Keys    |= BloomUiKeyBit(wParam);
+        w->input.NavKeys |= BloomNavKeyBit(wParam);
+        InterlockedIncrement(&w->input.Generation);
+        if (w == gWindow)
         {
-            w->input.Buttons = 0u;  // drop a tool window's held buttons on focus loss (no phantom drag)
+            // These cases pull WM_KEY* out of the default branch — the main window's only keyboard forward to
+            // the engine input system. Re-forward it so ImGui + the Forge HUD keep receiving keyboard.
+            BloomForwardInputToEngine(hwnd, message, wParam, lParam);
+        }
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+    {
+        w->input.Keys    &= ~BloomUiKeyBit(wParam);
+        w->input.NavKeys &= ~BloomNavKeyBit(wParam);
+        InterlockedIncrement(&w->input.Generation);
+        if (w == gWindow)
+        {
+            BloomForwardInputToEngine(hwnd, message, wParam, lParam);
+        }
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    case WM_CHAR:
+    {
+        const unsigned int Ch = (unsigned int)wParam;
+        if (Ch >= 32u && Ch < 127u && w->input.TextCharCount < 32u)  // printable ASCII (the font atlas range)
+        {
+            w->input.TextChars[w->input.TextCharCount++] = (char)Ch;
             InterlockedIncrement(&w->input.Generation);
         }
-        break;
+        if (w == gWindow)
+        {
+            BloomForwardInputToEngine(hwnd, message, wParam, lParam);
+        }
+        return DefWindowProcW(hwnd, message, wParam, lParam);
     }
     case WM_ENTERSIZEMOVE:
     {
@@ -1384,6 +1530,15 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         if (LOWORD(lParam) == HTCLIENT)
         {
+            if (w != gWindow)
+            {
+                // Tool window (or any non-main window): apply ITS OWN requested shape (setWindowCursor ->
+                // input.CursorShape), so e.g. the material editor shows an I-beam over its text fields instead
+                // of inheriting the main window's global cursor. CursorHidden wins (a window in free-look).
+                SetCursor(w->input.CursorHidden ? NULL : ShapeToHCursor(w->input.CursorShape));
+                gCursorInsideRectangle = true;
+                return TRUE;
+            }
             // BloomEngine: apply the app-requested cursor (setCursor -> gCurrentCursor) instead of forcing
             // the arrow, so custom-UI widgets can show an I-beam. Re-applied each move; return TRUE so
             // DefWindowProc doesn't override it with the window-class cursor.

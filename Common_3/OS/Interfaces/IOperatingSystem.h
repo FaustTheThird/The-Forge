@@ -191,6 +191,16 @@ typedef struct WindowInputState
     unsigned int  Buttons;      // held mouse-button bitmask (bit0 Left, bit1 Right, bit2 Middle)
     float         WheelAccum;   // wheel notches accumulated since the last drain (+ = up); zeroed on drain
     float         DeltaXAccum;  // raw relative X motion accumulated since the last drain (drag-scrub fields); zeroed on drain
+    unsigned int  Keys;         // held key bitmask, bit N == bloom UiKey N (0-23); the drain copies it straight
+    unsigned int  NavKeys;      // held game-movement keys (own layout: bit0 W,1 A,2 S,3 D,4 E,5 Q,6 Shift) — camera only
+    char          TextChars[32];// WM_CHAR-decoded printable ASCII typed since the last drain
+    unsigned int  TextCharCount;// count in TextChars; zeroed on drain (consume-once, like WheelAccum)
+    bool          HasFocus;     // this window holds keyboard focus (WM_SETFOCUS/KILLFOCUS)
+    // Cursor SHAPE flows the OTHER way from the fields above: the render-side UI pass stores the widget's
+    // requested shape via setWindowCursor; WM_SETCURSOR (pump thread) reads it and applies the HCURSOR. A
+    // lone byte/bool is torn-read-safe, mirroring the existing lock-free global cursor.
+    unsigned char CursorShape;  // raw bloom::UiCursor value (0 = arrow); the per-window UI cursor shape
+    bool          CursorHidden; // this window is in free-look (cursor hidden) — WM_SETCURSOR keeps it hidden
     volatile long Generation;   // bumped on every write — a seqlock guard (belt-and-suspenders; see the plan)
 } WindowInputState;
 
@@ -365,9 +375,14 @@ extern "C"
     FORGE_API void* createCursor(const char* path);
     FORGE_API void* getStandardCursor(uint32_t kind);  // BloomEngine: 0 = arrow, 1 = I-beam (path-free)
     FORGE_API void  setCursor(void* cursor);
+    // BloomEngine: per-window cursor shape (store-only). `shape` is a raw bloom::UiCursor value; WM_SETCURSOR
+    // applies it for THIS window. Unlike setCursor (global, eager), this never calls Win32 from the caller's
+    // thread — the OS/pump thread applies it, so each window (main + tool) shows its own widget cursor.
+    FORGE_API void  setWindowCursor(struct WindowDesc* winDesc, unsigned char shape);
     FORGE_API void  showCursor(void);
     FORGE_API void  hideCursor(void);
     FORGE_API bool  isCursorInsideTrackingArea(void);
+    FORGE_API bool  isMainWindowFocused(void);  // BloomEngine: main window has OS keyboard focus (UI focus-release)
     FORGE_API void  setMousePositionRelative(const WindowDesc* winDesc, int32_t x, int32_t y);
     FORGE_API void  setMousePositionAbsolute(int32_t x, int32_t y);
 
