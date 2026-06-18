@@ -1426,8 +1426,19 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             BloomForwardInputToEngine(hwnd, message, wParam, lParam);
             return DefWindowProcW(hwnd, message, wParam, lParam);
         }
-        w->input.CursorX = GET_X_LPARAM(lParam);
-        w->input.CursorY = GET_Y_LPARAM(lParam);
+        {
+            const int NewX = GET_X_LPARAM(lParam);
+            const int NewY = GET_Y_LPARAM(lParam);
+            // Relative X motion for drag-scrub fields. Only once we have a prior position (already inside, or
+            // mid-drag with a button held + SetCapture keeping moves coming past the client edge) — so entering
+            // the window doesn't register a jump.
+            if (w->input.CursorInside || w->input.Buttons != 0u)
+            {
+                w->input.DeltaXAccum += (float)(NewX - w->input.CursorX);
+            }
+            w->input.CursorX = NewX;
+            w->input.CursorY = NewY;
+        }
         w->input.CursorInside = true;
         TRACKMOUSEEVENT Tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0 };
         TrackMouseEvent(&Tme);  // request a WM_MOUSELEAVE when the cursor exits this window's client

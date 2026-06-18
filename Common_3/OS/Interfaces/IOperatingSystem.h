@@ -190,6 +190,7 @@ typedef struct WindowInputState
     bool          CursorInside; // cursor is over this window's client area
     unsigned int  Buttons;      // held mouse-button bitmask (bit0 Left, bit1 Right, bit2 Middle)
     float         WheelAccum;   // wheel notches accumulated since the last drain (+ = up); zeroed on drain
+    float         DeltaXAccum;  // raw relative X motion accumulated since the last drain (drag-scrub fields); zeroed on drain
     volatile long Generation;   // bumped on every write — a seqlock guard (belt-and-suspenders; see the plan)
 } WindowInputState;
 
