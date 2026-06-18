@@ -258,6 +258,14 @@ static void onResize(WindowDesc* wnd, int32_t newSizeX, int32_t newSizeY)
         return;
     }
 
+    // BloomEngine multi-window: a non-main window must not touch the app-global settings or trigger a
+    // main-swapchain reload. Flag its swapchain for rebuild before its next present and bail.
+    if (wnd != gWindow)
+    {
+        wnd->resizePending = true;
+        return;
+    }
+
     pWindowAppRef->mSettings.mFullScreen = wnd->fullScreen;
     if (pWindowAppRef->mSettings.mWidth == newSizeX && pWindowAppRef->mSettings.mHeight == newSizeY)
     {
@@ -543,9 +551,15 @@ void collectMonitorInfo()
     }
 }
 
-static void onFocusChanged(bool focused)
+static void onFocusChanged(WindowDesc* wnd, bool focused)
 {
     if (pWindowAppRef == nullptr || !pWindowAppRef->mSettings.mInitialized)
+    {
+        return;
+    }
+
+    // BloomEngine multi-window: only the main window drives the app-global focus flag.
+    if (wnd != gWindow)
     {
         return;
     }
@@ -678,13 +692,19 @@ void openWindow(const char* app_name, WindowDesc* winDesc)
     bool fullscreen = winDesc->fullScreen;
     winDesc->fullScreen = false;
 
+    // BloomEngine multi-window: hand winDesc to WinProc via lpCreateParams (last arg) so the WM_NCCREATE
+    // handler keys GWLP_USERDATA BEFORE the synchronous creation messages (WM_SIZE/WM_MOVE) arrive — without
+    // this, a tool window's early messages resolve to gWindow (the main window) and corrupt it.
     HWND hwnd = CreateWindowW(FORGE_WINDOW_CLASS, app, windowStyle, windowX, windowY, rect.right - windowX, rect.bottom - windowY, NULL,
-                              NULL, (HINSTANCE)GetModuleHandle(NULL), 0);
+                              NULL, (HINSTANCE)GetModuleHandle(NULL), winDesc);
 
     if (hwnd != NULL)
     {
         winDesc->handle.type = WINDOW_HANDLE_TYPE_WIN32;
         winDesc->handle.window = hwnd;
+
+        // Belt-and-suspenders: also key the window here, for any path that bypasses WM_NCCREATE.
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)winDesc);
 
         if (!winDesc->hide)
         {
@@ -728,7 +748,10 @@ bool handleMessages()
         TranslateMessage(&msg);
         DispatchMessage(&msg);
 
-        if (WM_CLOSE == msg.message || WM_QUIT == msg.message)
+        // BloomEngine multi-window: quit only on WM_QUIT — posted solely by the MAIN window's WinProc
+        // (PostQuitMessage). Keying on the peeked WM_CLOSE would quit the app when ANY window closes, even
+        // after the tool-window WinProc swallows its own close.
+        if (WM_QUIT == msg.message)
             quit = true;
     }
 
@@ -1191,7 +1214,26 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         return DefWindowProcW(hwnd, message, wParam, lParam);
     }
-    if (gWindow->borderlessWindow)
+
+    // BloomEngine multi-window: route every message to ITS window, not the global gWindow. The window is keyed
+    // on GWLP_USERDATA (set at WM_NCCREATE from lpCreateParams); a window not yet keyed (or the main window,
+    // whose WindowDesc IS gWindow) falls back to gWindow, so the single-window path is byte-identical.
+    if (message == WM_NCCREATE)
+    {
+        const CREATESTRUCTW* cs = (const CREATESTRUCTW*)lParam;
+        if (cs->lpCreateParams != nullptr)
+        {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+        }
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    WindowDesc* w = (WindowDesc*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (w == nullptr)
+    {
+        w = gWindow;
+    }
+
+    if (w->borderlessWindow)
     {
         switch (message)
         {
@@ -1208,7 +1250,7 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             return 0;
         }
         }
-    } // if (gWindow->borderlessWindow)
+    } // if (w->borderlessWindow)
 
     bool maximized = false;
     switch (message)
@@ -1223,7 +1265,7 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_DISPLAYCHANGE:
     {
         updateMonitorResolution(getMonitor(getActiveMonitorIdx()), (uint32_t)LOWORD(lParam), (uint32_t)HIWORD(lParam));
-        adjustWindow(gWindow, true);
+        adjustWindow(w, true);
         break;
     }
     case WM_GETMINMAXINFO:
@@ -1231,7 +1273,7 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         LPMINMAXINFO lpMMI = (LPMINMAXINFO)lParam;
 
         // Prevent window from collapsing
-        if (!gWindow->fullScreen)
+        if (!w->fullScreen)
         {
             LONG zoomOffset = 128;
             lpMMI->ptMinTrackSize.x = zoomOffset;
@@ -1251,14 +1293,14 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     case WM_MOVE:
     {
-        ResetWindowDescFullScreenRect(gWindow);
+        ResetWindowDescFullScreenRect(w);
         // Update the position of window
         // Note: Avoid resetting window or client size while processing WM_SIZE.
         // It can result in incorrect rectangle size returned by the OS.
-        if (!gWindow->fullScreen)
-            UpdateWindowDescWindowedPos(gWindow, (int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam));
+        if (!w->fullScreen)
+            UpdateWindowDescWindowedPos(w, (int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam));
         else
-            UpdateWindowDescClientPos(gWindow, (int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam));
+            UpdateWindowDescClientPos(w, (int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam));
         break;
     }
     case WM_STYLECHANGING:
@@ -1278,27 +1320,27 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             maximized = true;
             // fall through
         case SIZE_RESTORED:
-            onFocusChanged(true);
-            gWindow->maximized = maximized;
-            gWindow->minimized = false;
-            UpdateWindowDescClientSize(gWindow, width, height);
-            onResize(gWindow, getRectWidth(&gWindow->clientRect), getRectHeight(&gWindow->clientRect));
+            onFocusChanged(w, true);
+            w->maximized = maximized;
+            w->minimized = false;
+            UpdateWindowDescClientSize(w, width, height);
+            onResize(w, getRectWidth(&w->clientRect), getRectHeight(&w->clientRect));
             break;
         case SIZE_MINIMIZED:
-            onFocusChanged(false);
-            gWindow->minimized = true;
+            onFocusChanged(w, false);
+            w->minimized = true;
             break;
         }
         break;
     }
     case WM_SETFOCUS:
     {
-        onFocusChanged(true);
+        onFocusChanged(w, true);
         break;
     }
     case WM_KILLFOCUS:
     {
-        onFocusChanged(false);
+        onFocusChanged(w, false);
         break;
     }
     case WM_ENTERSIZEMOVE:
@@ -1308,14 +1350,14 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     case WM_EXITSIZEMOVE:
     {
-        onFocusChanged(true);
+        onFocusChanged(w, true);
         gWindowIsResizing = false;
-        if (!gWindow->fullScreen)
+        if (!w->fullScreen)
         {
-            gWindow->maximized = false;
-            ResetWindowDescWindowedRect(gWindow);
+            w->maximized = false;
+            ResetWindowDescWindowedRect(w);
         }
-        onResize(gWindow, getRectWidth(&gWindow->clientRect), getRectHeight(&gWindow->clientRect));
+        onResize(w, getRectWidth(&w->clientRect), getRectHeight(&w->clientRect));
         break;
     }
     case WM_SETCURSOR:
@@ -1339,8 +1381,16 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_DESTROY:
     case WM_CLOSE:
     {
-        PostQuitMessage(0);
-        break;
+        // BloomEngine multi-window: only the main window quits the app. A tool window's close box is swallowed
+        // (return 0, no DefWindowProc destroy) and flagged; the game thread tears it down between frames so no
+        // swapchain dies mid-present.
+        if (w == gWindow)
+        {
+            PostQuitMessage(0);
+            break;
+        }
+        w->closeRequested = true;
+        return 0;
     }
     case WM_GETTEXT:
     {
@@ -1348,13 +1398,18 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     default:
     {
-        MSG msg = {};
-        msg.hwnd = hwnd;
-        msg.lParam = lParam;
-        msg.message = message;
-        msg.wParam = wParam;
-        extern void platformInputEvent(const MSG* msg);
-        platformInputEvent(&msg);
+        // BloomEngine multi-window: only the main window feeds the engine input system. A tool window
+        // consumes no input in this slice — its own per-window input arbitration lands in a later stage.
+        if (w == gWindow)
+        {
+            MSG msg = {};
+            msg.hwnd = hwnd;
+            msg.lParam = lParam;
+            msg.message = message;
+            msg.wParam = wParam;
+            extern void platformInputEvent(const MSG* msg);
+            platformInputEvent(&msg);
+        }
 
         return DefWindowProcW(hwnd, message, wParam, lParam);
     }

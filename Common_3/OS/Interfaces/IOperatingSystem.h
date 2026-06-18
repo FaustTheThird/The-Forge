@@ -211,6 +211,13 @@ typedef struct WindowDesc
     bool    mCursorCaptured;
     bool    mMinimizeRequested;
 
+    // BloomEngine multi-window: per-window signals the WinProc raises and the game thread drains between
+    // frames (while the render worker is idle). closeRequested is set when a non-main window's close box is
+    // hit — the window is torn down later, off the message pump, so no swapchain dies mid-present.
+    // resizePending marks a non-main window whose swapchain must be rebuilt before its next present.
+    bool    closeRequested;
+    bool    resizePending;
+
 #if WINDOW_DETAILS
     bstring pWindowedRectLabel;
     bstring pFullscreenRectLabel;
