@@ -179,6 +179,20 @@ typedef struct WindowHandle
 #endif
 } WindowHandle;
 
+// BloomEngine multi-window: per-window mouse input the WinProc accumulates for a NON-main (tool) window, so
+// each tool window drives its own UI without touching the main window's engine-input path. Plain C scalars
+// (this header compiles as C too). Buttons mirror bloom UiMouse (bit0 Left, bit1 Right, bit2 Middle); the
+// game thread drains it between frames into a bloom::UiInput (the render worker is idle then — see the doc).
+typedef struct WindowInputState
+{
+    int32_t       CursorX;      // client-relative px (valid only while CursorInside)
+    int32_t       CursorY;
+    bool          CursorInside; // cursor is over this window's client area
+    unsigned int  Buttons;      // held mouse-button bitmask (bit0 Left, bit1 Right, bit2 Middle)
+    float         WheelAccum;   // wheel notches accumulated since the last drain (+ = up); zeroed on drain
+    volatile long Generation;   // bumped on every write — a seqlock guard (belt-and-suspenders; see the plan)
+} WindowInputState;
+
 typedef struct WindowDesc
 {
     WindowHandle handle;
@@ -217,6 +231,10 @@ typedef struct WindowDesc
     // resizePending marks a non-main window whose swapchain must be rebuilt before its next present.
     bool    closeRequested;
     bool    resizePending;
+
+    // Per-window mouse input (a NON-main window only; the main window keeps using the engine input system).
+    // Zero-initialised at window creation (CursorInside false => the drain reports an off-screen cursor).
+    WindowInputState input;
 
 #if WINDOW_DETAILS
     bstring pWindowedRectLabel;

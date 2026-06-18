@@ -1207,6 +1207,21 @@ uint32_t getActiveMonitorIdx()
 // MONITOR AND RESOLUTION HANDLING INTERFACE FUNCTIONS
 //------------------------------------------------------------------------
 
+// BloomEngine multi-window: forward a message to the engine input system EXACTLY as the WinProc default case
+// does (the only place it runs for the main window). The new per-window mouse cases below call this on the
+// w == gWindow branch so the main window's input path stays byte-identical (adding a `case` removes that
+// message from `default`, so each new case must replicate the forward itself).
+static void BloomForwardInputToEngine(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    MSG msg = {};
+    msg.hwnd = hwnd;
+    msg.lParam = lParam;
+    msg.message = message;
+    msg.wParam = wParam;
+    extern void platformInputEvent(const MSG* msg);
+    platformInputEvent(&msg);
+}
+
 // Window event handler - Use as less as possible
 LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
@@ -1341,6 +1356,11 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_KILLFOCUS:
     {
         onFocusChanged(w, false);
+        if (w != gWindow)
+        {
+            w->input.Buttons = 0u;  // drop a tool window's held buttons on focus loss (no phantom drag)
+            InterlockedIncrement(&w->input.Generation);
+        }
         break;
     }
     case WM_ENTERSIZEMOVE:
@@ -1396,10 +1416,91 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         break;
     }
+    // BloomEngine multi-window: per-window MOUSE input. These messages previously hit `default`; now they hit
+    // here for ALL windows, so the main window (w == gWindow) MUST forward exactly as `default` did. A tool
+    // window (w != gWindow) records into w->input instead (drained game-side into the tool's UiContext).
+    case WM_MOUSEMOVE:
+    {
+        if (w == gWindow)
+        {
+            BloomForwardInputToEngine(hwnd, message, wParam, lParam);
+            return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+        w->input.CursorX = GET_X_LPARAM(lParam);
+        w->input.CursorY = GET_Y_LPARAM(lParam);
+        w->input.CursorInside = true;
+        TRACKMOUSEEVENT Tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&Tme);  // request a WM_MOUSELEAVE when the cursor exits this window's client
+        InterlockedIncrement(&w->input.Generation);
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    case WM_MOUSELEAVE:
+    {
+        if (w == gWindow)
+        {
+            BloomForwardInputToEngine(hwnd, message, wParam, lParam);
+            return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+        w->input.CursorInside = false;  // held buttons persist (a capture-drag past the edge keeps reporting)
+        InterlockedIncrement(&w->input.Generation);
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    {
+        if (w == gWindow)
+        {
+            BloomForwardInputToEngine(hwnd, message, wParam, lParam);
+            return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+        const unsigned int Bit = (message == WM_LBUTTONDOWN) ? 1u : (message == WM_RBUTTONDOWN) ? 2u : 4u;
+        if (w->input.Buttons == 0u)
+        {
+            SetCapture(hwnd);  // keep receiving moves/up even if the drag leaves the client rect
+        }
+        w->input.Buttons |= Bit;
+        w->input.CursorX = GET_X_LPARAM(lParam);
+        w->input.CursorY = GET_Y_LPARAM(lParam);
+        w->input.CursorInside = true;
+        InterlockedIncrement(&w->input.Generation);
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONUP:
+    {
+        if (w == gWindow)
+        {
+            BloomForwardInputToEngine(hwnd, message, wParam, lParam);
+            return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+        const unsigned int Bit = (message == WM_LBUTTONUP) ? 1u : (message == WM_RBUTTONUP) ? 2u : 4u;
+        w->input.Buttons &= ~Bit;
+        w->input.CursorX = GET_X_LPARAM(lParam);
+        w->input.CursorY = GET_Y_LPARAM(lParam);
+        if (w->input.Buttons == 0u)
+        {
+            ReleaseCapture();
+        }
+        InterlockedIncrement(&w->input.Generation);
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+    case WM_MOUSEWHEEL:
+    {
+        if (w == gWindow)
+        {
+            BloomForwardInputToEngine(hwnd, message, wParam, lParam);
+            return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+        w->input.WheelAccum += (float)GET_WHEEL_DELTA_WPARAM(wParam) / (float)WHEEL_DELTA;  // notches (+ = up)
+        InterlockedIncrement(&w->input.Generation);
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
     default:
     {
-        // BloomEngine multi-window: only the main window feeds the engine input system. A tool window
-        // consumes no input in this slice — its own per-window input arbitration lands in a later stage.
+        // The main window feeds the engine input system; a tool window's non-mouse messages are left to the OS
+        // (its mouse input is handled by the cases above; keyboard/text per-window input lands in a later stage).
         if (w == gWindow)
         {
             MSG msg = {};
