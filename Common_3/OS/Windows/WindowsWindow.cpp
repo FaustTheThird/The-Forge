@@ -1301,6 +1301,7 @@ static unsigned int BloomUiKeyBit(WPARAM vk)
     case VK_MENU:    return 1u << 21;  // Alt
     case VK_UP:      return 1u << 22;  // Up
     case VK_DOWN:    return 1u << 23;  // Down
+    case 'S':        return 1u << 24;  // Ctrl+S save (movement S also rides NavKeys)
     default:         return 0u;
     }
 }
