@@ -3249,7 +3249,9 @@ void addSwapChain(Renderer* pRenderer, const SwapChainDesc* pDesc, SwapChain** p
         .mFlags = TEXTURE_CREATION_FLAG_ALLOW_DISPLAY_TARGET,
         .mStartState = RESOURCE_STATE_PRESENT,
     };
-#ifdef AUTOMATED_TESTING
+#if defined(AUTOMATED_TESTING) || defined(ENABLE_SCREENSHOT)
+    // Make the back buffers shader-readable so the screenshot capturer can sample the presented frame
+    // (captureScreenshot binds pRenderTarget->pTexture as an SRV). A spare SRV descriptor is otherwise unused.
     descColor.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
 #endif
 #if defined(XBOX)
