@@ -254,6 +254,15 @@ typedef struct IndirectDispatchArguments
     uint32_t mGroupCountZ;
 } IndirectDispatchArguments;
 
+// Bloom-M13a-args: D3D12 DispatchMesh indirect args (D3D12_DISPATCH_MESH_ARGUMENTS).
+typedef struct IndirectDispatchMeshArguments
+{
+    uint32_t mGroupCountX;
+    uint32_t mGroupCountY;
+    uint32_t mGroupCountZ;
+} IndirectDispatchMeshArguments;
+#define INDIRECT_DISPATCH_MESH_ELEM_INDEX(m) (offsetof(IndirectDispatchMeshArguments, m) / sizeof(uint32_t))
+
 #define INDIRECT_DRAW_ELEM_INDEX(m)       (offsetof(IndirectDrawArguments, m) / sizeof(uint32_t))
 #define INDIRECT_DRAW_INDEX_ELEM_INDEX(m) (offsetof(IndirectDrawIndexArguments, m) / sizeof(uint32_t))
 #define INDIRECT_DISPATCH_ELEM_INDEX(m)   (offsetof(IndirectDispatchArguments, m) / sizeof(uint32_t))
@@ -263,6 +272,7 @@ typedef enum IndirectArgumentType
     INDIRECT_DRAW,
     INDIRECT_DRAW_INDEX,
     INDIRECT_DISPATCH,
+    INDIRECT_DISPATCH_MESH, // Bloom-M13a-enum
     INDIRECT_COMMAND_BUFFER,         // metal ICB
     INDIRECT_COMMAND_BUFFER_RESET,   // metal ICB reset
     INDIRECT_COMMAND_BUFFER_OPTIMIZE // metal ICB optimization

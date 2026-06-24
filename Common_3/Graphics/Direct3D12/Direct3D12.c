@@ -322,6 +322,7 @@ typedef struct NullDescriptors
     ID3D12CommandSignature* pDrawCommandSignature[MAX_LINKED_GPUS];
     ID3D12CommandSignature* pDrawIndexCommandSignature[MAX_LINKED_GPUS];
     ID3D12CommandSignature* pDispatchCommandSignature[MAX_LINKED_GPUS];
+    ID3D12CommandSignature* pDispatchMeshCommandSignature[MAX_LINKED_GPUS]; // Bloom-M13a-member
 #if defined(XBOX)
     ID3D12CommandSignature* pAsyncDispatchCommandSignature[MAX_LINKED_GPUS];
 #endif
@@ -1148,6 +1149,12 @@ static void add_default_resources(Renderer* pRenderer)
         CHECK_HRESULT(COM_CALL(CreateCommandSignature, pRenderer->mDx.pDevice, &desc, NULL,
                                IID_ARGS(ID3D12CommandSignature, &pRenderer->pNullDescriptors->pDispatchCommandSignature[l])));
 
+        // Bloom-M13a-create: DispatchMesh indirect command signature.
+        arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+        desc.ByteStride = sizeof(IndirectDispatchMeshArguments);
+        CHECK_HRESULT(COM_CALL(CreateCommandSignature, pRenderer->mDx.pDevice, &desc, NULL,
+                               IID_ARGS(ID3D12CommandSignature, &pRenderer->pNullDescriptors->pDispatchMeshCommandSignature[l])));
+
 #if defined(XBOX)
         hook_fill_dispatch_indirect_argument_desc(&arg, true);
         desc.ByteStride = sizeof(IndirectDispatchArguments);
@@ -1177,6 +1184,7 @@ static void remove_default_resources(Renderer* pRenderer)
         SAFE_RELEASE(pRenderer->pNullDescriptors->pDrawCommandSignature[l]);
         SAFE_RELEASE(pRenderer->pNullDescriptors->pDrawIndexCommandSignature[l]);
         SAFE_RELEASE(pRenderer->pNullDescriptors->pDispatchCommandSignature[l]);
+        SAFE_RELEASE(pRenderer->pNullDescriptors->pDispatchMeshCommandSignature[l]); // Bloom-M13a-release
 #if defined(XBOX)
         SAFE_RELEASE(pRenderer->pNullDescriptors->pAsyncDispatchCommandSignature[l]);
 #endif
@@ -6296,6 +6304,9 @@ void cmdExecuteIndirect(Cmd* pCmd, IndirectArgumentType type, uint32_t maxComman
         {
             cmdSignature = pCmd->pRenderer->pNullDescriptors->pDispatchCommandSignature[nodeIndex];
         }
+        break;
+    case INDIRECT_DISPATCH_MESH: // Bloom-M13a-exec
+        cmdSignature = pCmd->pRenderer->pNullDescriptors->pDispatchMeshCommandSignature[nodeIndex];
         break;
     default:
         ASSERTFAIL("Invalid IndirectArgumentType %u", (uint32_t)type);
