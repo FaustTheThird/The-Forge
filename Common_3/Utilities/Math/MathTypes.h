@@ -46,31 +46,35 @@
 #pragma clang diagnostic pop
 #endif
 
-typedef Vector2 vec2;
-typedef Vector3 vec3;
-typedef Vector4 vec4;
+// Qualified through VectormathForge:: (see vectormath.hpp) so these resolve even when Bloom
+// suppresses the global Vectormath using-directives via BLOOM_NO_GLOBAL_VECTORMATH — the vec*/
+// mat* aliases stay global, but the raw Vector2/3/4 names never leak to collide with Bloom's
+// native math. Identical types either way.
+typedef VectormathForge::Vector2 vec2;
+typedef VectormathForge::Vector3 vec3;
+typedef VectormathForge::Vector4 vec4;
 
-typedef IVector2 ivec2;
-typedef IVector3 ivec3;
-typedef IVector4 ivec4;
+typedef VectormathForge::IVector2 ivec2;
+typedef VectormathForge::IVector3 ivec3;
+typedef VectormathForge::IVector4 ivec4;
 
-typedef UVector2 uvec2;
-typedef UVector3 uvec3;
-typedef UVector4 uvec4;
+typedef VectormathForge::UVector2 uvec2;
+typedef VectormathForge::UVector3 uvec3;
+typedef VectormathForge::UVector4 uvec4;
 
-typedef Matrix2 mat2;
-typedef Matrix3 mat3;
-typedef Matrix4 mat4;
+typedef VectormathForge::Matrix2 mat2;
+typedef VectormathForge::Matrix3 mat3;
+typedef VectormathForge::Matrix4 mat4;
 
 // Double-precision's inception was to fix facebook maps. Initial implementation was with scalars.
 // Neon implementation was made to improve performance. Neon mirrors sse (see sse2neon.h) so sse exists as a bonus.
 // Playstation uses its own SCE implementation hence this preprocessor.
 // (Currently no need to support double-precision elsewhere then moble).
 #if !VECTORMATH_MODE_SCE
-typedef Vector3d vec3d;
-typedef Vector4d vec4d;
-typedef Matrix3d mat3d;
-typedef Matrix4d mat4d;
+typedef VectormathForge::Vector3d vec3d;
+typedef VectormathForge::Vector4d vec4d;
+typedef VectormathForge::Matrix3d mat3d;
+typedef VectormathForge::Matrix4d mat4d;
 #endif
 
 #endif // THEFORGE_INCLUDE_MATHTYPES_H
