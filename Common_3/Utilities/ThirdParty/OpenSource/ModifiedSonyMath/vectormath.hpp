@@ -120,6 +120,8 @@ using Vectormath::round_up;
 using Vectormath::round_up_64;
 using Vectormath::round_down;
 using Vectormath::round_down_64;
+using Vectormath::min;  // scalar + float2..4/uint2..4 overload set — InputCommon.h calls the scalar form unqualified
+using Vectormath::max;
 #endif
 
 // VectormathForge — a confined re-export of the Sony vector/matrix types (impl namespace
