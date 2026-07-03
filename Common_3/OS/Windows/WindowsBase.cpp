@@ -252,6 +252,80 @@ void exitBaseSubsystems()
 }
 
 //------------------------------------------------------------------------
+// BLOOM LIVE RESIZE — ONE APP FRAME PUMPED FROM THE MODAL SIZING LOOP
+//------------------------------------------------------------------------
+
+// Minimum spacing between two applications of a pending RESIZE reload while a drag is live. A reload is
+// the full swapchain/render-target rebuild behind a whole-GPU idle — running it on every WM_SIZE step
+// would serialize the drag on back-to-back device idles. Between rebuilds the frame still renders and
+// presents at the previous size (the OS stretches it), bounded by this window. The final drag size is
+// always exact: WM_EXITSIZEMOVE requests a reload and the resumed main loop applies it unthrottled.
+static const int64_t BLOOM_SIZEMOVE_RELOAD_THROTTLE_USEC = 150000;
+
+// Runs one full app frame from inside the Win32 modal sizing loop (WindowsWindow.cpp's WM_TIMER between
+// WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE). This is safe because the modal loop is entered from
+// DefWindowProc inside handleMessages() — the main loop above is parked BETWEEN frames, so running
+// reload + update + draw here meets exactly the frame-boundary preconditions the main loop provides.
+// The body mirrors one main-loop iteration minus handleMessages (the modal loop is already dispatching
+// messages; pumping them again from inside a dispatch would recurse). Skips instead of waiting whenever
+// a frame is impossible or already in progress: quit/uninitialized/minimized, a pending device reset
+// (only the real main loop may run its window re-open + full re-init), or re-entry (a nested message
+// pump inside Update/Draw — e.g. a closing tool window's DestroyWindow drain — delivering another
+// WM_TIMER while a pumped frame is still on the stack).
+void bloomPumpAppFrameDuringSizeMove()
+{
+    static bool    gPumping = false;
+    static int64_t gLastPumpUsec = 0;
+    static int64_t gLastReloadUsec = 0;
+
+    if (gPumping || pApp == nullptr || !pApp->mSettings.mInitialized || pApp->mSettings.mQuit)
+        return;
+    if (gResetDescriptor.mType != RESET_TYPE_NONE)
+        return;
+    if (gWindow == nullptr || gWindow->minimized)
+        return;
+
+    gPumping = true;
+
+    const int64_t nowUsec = getUSec(false);
+    float         deltaTime = gLastPumpUsec != 0 ? CounterToSecondsElapsed(gLastPumpUsec, nowUsec) : 1.0f / 60.0f;
+    gLastPumpUsec = nowUsec;
+    if (deltaTime > 0.1f)
+    {
+        // First tick of a new drag — the gap since the previous drag's last tick is not a frame.
+        deltaTime = 1.0f / 60.0f;
+    }
+
+    extern void platformUpdateLastInputState();
+    platformUpdateLastInputState();
+    updateBaseSubsystems(deltaTime, true);
+
+    // Apply a pending resize reload (WM_SIZE ran onResize -> requestReload), throttled. Spacing is
+    // measured from the previous rebuild's END, so a rebuild slower than the interval still leaves a
+    // full interval of live frames before the next one. A reload left pending here is applied by a
+    // later tick or by the resumed main loop — never lost.
+    if (gReloadDescriptor.mType != RELOAD_TYPE_ALL && nowUsec - gLastReloadUsec >= BLOOM_SIZEMOVE_RELOAD_THROTTLE_USEC)
+    {
+        pApp->Unload(&gReloadDescriptor);
+        if (!pApp->Load(&gReloadDescriptor))
+        {
+            // Mirror the main loop's fatal-load exit as closely as a WndProc callee can: flag the quit;
+            // the resumed main loop reads mQuit and leaves.
+            pApp->mSettings.mQuit = true;
+            gPumping = false;
+            return;
+        }
+        gReloadDescriptor.mType = RELOAD_TYPE_ALL;
+        gLastReloadUsec = getUSec(false);
+    }
+
+    pApp->Update(deltaTime);
+    pApp->Draw();
+
+    gPumping = false;
+}
+
+//------------------------------------------------------------------------
 // PLATFORM LAYER USER INTERFACE
 //------------------------------------------------------------------------
 

@@ -46,6 +46,10 @@ IApp* pWindowAppRef = NULL;
 WindowDesc* gWindow = nullptr;
 bool        gWindowIsResizing = false;
 
+// BloomEngine live resize: the per-window timer id armed for the span of a modal drag
+// (WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE); its ticks pump one app frame from inside the modal loop.
+static const UINT_PTR BLOOM_SIZEMOVE_TIMER_ID = 0xB100;
+
 bool      gWindowClassInitialized = false;
 WNDCLASSW gWindowClass;
 
@@ -1302,12 +1306,16 @@ static unsigned int BloomUiKeyBit(WPARAM vk)
     case VK_UP:      return 1u << 22;  // Up
     case VK_DOWN:    return 1u << 23;  // Down
     case 'S':        return 1u << 24;  // Ctrl+S save (movement S also rides NavKeys)
+    case VK_F2:      return 1u << 25;  // F2 rename
+    case 'D':        return 1u << 26;  // preview-viewport fly strafe-right
+    case 'Q':        return 1u << 27;  // preview-viewport fly descend
+    case 'F':        return 1u << 28;  // frame the selection / preview bounds
     default:         return 0u;
     }
 }
 
 // Maps a Win32 virtual-key to a game-movement NavKey bit, or 0. Own layout (bit0 W,1 A,2 S,3 D,4 E,5 Q,6 Shift)
-// because UiKey omits S/D/Q; the camera reads these, the UI keymap never sees them.
+// because the camera reads these directly; the UI keymap carries its own copies of the letters it needs.
 static unsigned int BloomNavKeyBit(WPARAM vk)
 {
     switch (vk)
@@ -1513,10 +1521,31 @@ LRESULT CALLBACK WinProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_ENTERSIZEMOVE:
     {
         gWindowIsResizing = true;
+        // BloomEngine live resize: DefWindowProc runs a modal message loop for the whole drag, starving
+        // the frame loop — without this, nothing renders until release and the OS stretches the last
+        // presented frame. A per-window timer fires inside that modal loop (WM_TIMER is delivered
+        // whenever the queue is otherwise idle, i.e. between drag steps) and pumps one full app frame
+        // per tick, so the viewport tracks the drag live. Works for the main window AND tool windows:
+        // the pumped frame is the whole engine frame, which rebuilds/presents every surface.
+        SetTimer(hwnd, BLOOM_SIZEMOVE_TIMER_ID, USER_TIMER_MINIMUM, NULL);
         break;
+    }
+    case WM_TIMER:
+    {
+        if (wParam == BLOOM_SIZEMOVE_TIMER_ID)
+        {
+            if (gWindowIsResizing)
+            {
+                extern void bloomPumpAppFrameDuringSizeMove();
+                bloomPumpAppFrameDuringSizeMove();
+            }
+            return 0;
+        }
+        return DefWindowProcW(hwnd, message, wParam, lParam);
     }
     case WM_EXITSIZEMOVE:
     {
+        KillTimer(hwnd, BLOOM_SIZEMOVE_TIMER_ID);
         onFocusChanged(w, true);
         gWindowIsResizing = false;
         if (!w->fullScreen)
