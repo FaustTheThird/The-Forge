@@ -2126,16 +2126,28 @@ GPUPresetLevel getGPUPresetLevel(uint32_t vendorId, uint32_t modelId, const char
         }
     }
 
-#if defined(ENABLE_GRAPHICS_RUNTIME_CHECK)
-    if (presetLevel != GPU_PRESET_NONE)
-    {
-        LOGF(eINFO, "Setting preset level %s for gpu vendor:%s model:%s", presetLevelToString(presetLevel), vendorName, modelName);
-    }
-    else
+    // BLOOM DIVERGENCE from upstream The-Forge. The fallback below used to live INSIDE the
+    // ENABLE_GRAPHICS_RUNTIME_CHECK block, which is debug-only — so a Release build left presetLevel at
+    // GPU_PRESET_NONE for any GPU absent from gpu.data, and Direct3D12.c's "< GPU_PRESET_VERYLOW" gate then
+    // destroyed the device and returned a null renderer. That made every GPU newer than the vendored gpu.data
+    // snapshot unable to run a SHIPPING build at all while debug builds worked, and the error blamed an
+    // "Office Preset" that was never set (the value is NONE — the model was simply never found). gpu.data
+    // declares DefaultPresetLevel precisely to be this fallback, so honour it in every configuration; the
+    // preset gates nothing but that check and the GPU-selection ranking, so an unknown GPU degrades to the
+    // declared default and RUNS rather than dying.
+    const bool FoundInGpuData = presetLevel != GPU_PRESET_NONE;
+    if (!FoundInGpuData)
     {
         presetLevel = gDefaultPresetLevel;
+        // Warn in EVERY configuration: this is how a user on new hardware learns their GPU is missing from
+        // gpu.data. Hiding it behind the debug-only block is what let the crash above ship unnoticed.
         LOGF(eWARNING, "Couldn't find gpu %s model: %s in gpu.data. Setting preset to %s as a default.", vendorName, modelName,
              presetLevelToString(presetLevel));
+    }
+#if defined(ENABLE_GRAPHICS_RUNTIME_CHECK)
+    if (FoundInGpuData)
+    {
+        LOGF(eINFO, "Setting preset level %s for gpu vendor:%s model:%s", presetLevelToString(presetLevel), vendorName, modelName);
     }
 #endif
 
