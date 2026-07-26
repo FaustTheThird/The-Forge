@@ -34,7 +34,127 @@ targetToMslEntry = {
     Stages.VERT: 'vertex',
     Stages.FRAG: 'fragment',
     Stages.COMP: 'kernel',
+    Stages.MESH: 'mesh',
 }
+
+# HLSL's [outputtopology("...")] argument spelled as MSL's metal::topology enumerator.
+outputTopologyToMsl = {
+    'point':    'point',
+    'line':     'line',
+    'triangle': 'triangle',
+}
+
+# The mesh<> object the entry point writes through, and the write-through views that give
+# the HLSL output arrays their element-at-a-time syntax. HLSL assigns an output element
+# field by field (OutVerts[i].Position = ...) and MSL takes a whole element through
+# set_vertex / set_primitive, so a view stages one element per thread and stores it when
+# the write index moves on or when the entry point returns. The views change nothing about
+# where the source writes: the staged store lands on the same threads, under the same
+# conditions, in the same order.
+MESH_WRITER_DECL = '''
+template <typename MESH, typename T>
+struct _fslMeshVertexWriter
+{
+	thread MESH* mesh;
+	T            staged;
+	uint         index;
+	bool         active;
+
+	thread T& operator[](uint i) thread
+	{
+		if (active && index != i)
+		{
+			mesh->set_vertex(index, staged);
+			active = false;
+		}
+		if (!active)
+		{
+			staged = T();
+			index = i;
+			active = true;
+		}
+		return staged;
+	}
+
+	void flush() thread
+	{
+		if (active)
+		{
+			mesh->set_vertex(index, staged);
+			active = false;
+		}
+	}
+};
+
+template <typename MESH, typename T>
+struct _fslMeshPrimitiveWriter
+{
+	thread MESH* mesh;
+	T            staged;
+	uint         index;
+	bool         active;
+
+	thread T& operator[](uint i) thread
+	{
+		if (active && index != i)
+		{
+			mesh->set_primitive(index, staged);
+			active = false;
+		}
+		if (!active)
+		{
+			staged = T();
+			index = i;
+			active = true;
+		}
+		return staged;
+	}
+
+	void flush() thread
+	{
+		if (active)
+		{
+			mesh->set_primitive(index, staged);
+			active = false;
+		}
+	}
+};
+
+// One primitive's index tuple. The overload that matches the declared element type of the
+// `out indices` array decides how many indices the primitive consumes, so a triangle list
+// and a line list write through the same syntax.
+template <typename MESH>
+struct _fslMeshIndexRef
+{
+	thread MESH* mesh;
+	uint         primitive;
+
+	void operator=(uint3 v) thread
+	{
+		mesh->set_index(primitive * 3u + 0u, v.x);
+		mesh->set_index(primitive * 3u + 1u, v.y);
+		mesh->set_index(primitive * 3u + 2u, v.z);
+	}
+
+	void operator=(uint2 v) thread
+	{
+		mesh->set_index(primitive * 2u + 0u, v.x);
+		mesh->set_index(primitive * 2u + 1u, v.y);
+	}
+
+	void operator=(uint v) thread
+	{
+		mesh->set_index(primitive, v);
+	}
+};
+
+template <typename MESH>
+struct _fslMeshIndexWriter
+{
+	thread MESH* mesh;
+	_fslMeshIndexRef<MESH> operator[](uint i) thread { return _fslMeshIndexRef<MESH>{mesh, i}; }
+};
+'''
 
 def typeToMember(name):
     return 'm_'+name
@@ -82,6 +202,22 @@ def metal(platform: Platforms, debug, binary: ShaderBinary, dst):
     # directly embed metal header in shader
     shader_src += ['#include "includes/metal.h"\n']
 
+    # Mesh-stage output shape, taken from the `out vertices/indices/primitives` entry
+    # arguments. MSL has no such parameters: the three arrays collapse into one mesh<>
+    # object, so the element types and capacities have to be carried over here.
+    mesh_outputs = {kind: (dtype, name, count) for kind, dtype, name, count in shader.mesh_outputs}
+    mesh_object = '_fslMeshOut'
+    mesh_topology = 'triangle'
+    mesh_num_threads = [1, 1, 1]
+    mesh_out_structs = []
+    mesh_return_seen = False
+    if shader.stage == Stages.MESH:
+        for kind in ('vertices', 'indices', 'primitives'):
+            fsl_assert(kind in mesh_outputs, binary.filename,
+                       message='mesh entry is missing its `out {}` argument'.format(kind))
+        for kind in ('vertices', 'primitives'):
+            mesh_out_structs += [mesh_outputs[kind][0]]
+        shader_src += [MESH_WRITER_DECL]
 
     ids = [4,0,0]
 
@@ -270,6 +406,30 @@ def metal(platform: Platforms, debug, binary: ShaderBinary, dst):
 
         #  Shader I/O
         if struct and line.strip().startswith('DATA('):
+            if struct in mesh_out_structs:
+                # A mesh stage's per-vertex and per-primitive output structs are also the
+                # fragment stage's inputs, so they carry the fragment-side attributes: the
+                # clip position and the interpolation qualifiers. Everything else is user
+                # data that MSL matches by layout.
+                dtype, name, sem = getMacro(line)
+                sem = sem.upper()
+                interpolation_modifier = get_interpolation_modifier(dtype)
+
+                attribute = ''
+                if 'SV_POSITION' in sem:
+                    attribute = '[[position]]'
+                    if Features.INVARIANT in binary.features:
+                        attribute = '[[position, invariant]]'
+                elif 'SV_RENDERTARGETARRAYINDEX' in sem:
+                    attribute = '[[render_target_array_index]]'
+                elif interpolation_modifier:
+                    attribute = f'[[{interpolation_modifier}]]'
+                    dtype = getMacro(dtype) # consume modifier
+
+                shader_src += ['#line {}\n'.format(line_index)]
+                shader_src += [get_whitespace(line), dtype, ' ', name, ' ', attribute, ';\n']
+                continue
+
             if shader.returnType and struct in shader.returnType:
                 var = getMacro(shader.returnType)
                 dtype, name, sem = getMacro(line)
@@ -502,6 +662,30 @@ def metal(platform: Platforms, debug, binary: ShaderBinary, dst):
             shader_src += ['#line {}\n'.format(line_index)]
             continue
 
+        # A mesh entry declares its threadgroup size and output topology with the HLSL
+        # attributes, which MSL spells on the entry qualifier instead: the topology is a
+        # template argument of mesh<> and the threadgroup size is
+        # max_total_threads_per_threadgroup. Consume them here and rebuild them at the
+        # entry point.
+        if shader.stage == Stages.MESH and line.strip().startswith('[numthreads('):
+            elems = getMacro(line.strip())
+            for i, elem in enumerate(elems):
+                if not elem.isnumeric():
+                    assert elem in shader.defines, "arg {} to numthreads needs to be defined!".format(elem)
+                    elems[i] = shader.defines[elem]
+            mesh_num_threads = [int(d) for d in elems]
+            binary.num_threads = mesh_num_threads
+            shader_src += ['#line {}\n'.format(line_index)]
+            continue
+
+        if shader.stage == Stages.MESH and line.strip().startswith('[outputtopology('):
+            topology = getMacro(line.strip()).strip().strip('"')
+            fsl_assert(topology in outputTopologyToMsl, fi, line_index,
+                       message='unsupported output topology \'{}\''.format(topology))
+            mesh_topology = outputTopologyToMsl[topology]
+            shader_src += ['#line {}\n'.format(line_index)]
+            continue
+
         # create comment hint for shader reflection
         if 'NUM_THREADS(' in line:
             elems = getMacro(line)
@@ -524,12 +708,58 @@ def metal(platform: Platforms, debug, binary: ShaderBinary, dst):
             if shader.returnType:
                 mtl_returntype = getMacroName(shader.returnType)
 
-            shader_src += [msl_target, ' ', mtl_returntype, ' ', binary.filename.replace('.', '_'),  '(\n']
-            main_entry_line_index = len(shader_src)
-            prefix = '\t'
-            for dtype, var in shader.struct_args:
-                shader_src += [ prefix+dtype+' '+var+'[[stage_in]]\n']
+            if shader.stage == Stages.MESH:
+                vertex_type, _, vertex_count = mesh_outputs['vertices']
+                prim_type, _, prim_count = mesh_outputs['primitives']
+                _, _, index_count = mesh_outputs['indices']
+                fsl_assert(cleaneval(index_count) == cleaneval(prim_count), binary.filename,
+                           message='mesh `out indices` and `out primitives` must have the same length')
+
+                shader_src += ['using ', mesh_object, ' = metal::mesh<', vertex_type, ', ', prim_type,
+                               ', ', str(cleaneval(vertex_count)), ', ', str(cleaneval(prim_count)),
+                               ', metal::topology::', mesh_topology, '>;\n']
+                # The threadgroup is one-dimensional in MSL, so the declared extents fold
+                # into the total thread count; the entry reads its own position through the
+                # SV_GroupThreadID argument exactly as it did in HLSL.
+                total_threads = mesh_num_threads[0] * mesh_num_threads[1] * mesh_num_threads[2]
+                shader_src += ['[[mesh, max_total_threads_per_threadgroup(', str(total_threads), ')]]\n']
+                shader_src += ['void ', binary.filename.replace('.', '_'), '(\n']
+                main_entry_line_index = len(shader_src)
+                shader_src += ['\t', mesh_object, ' _fslMesh\n']
                 prefix = '\t,'
+
+                writer_decls = []
+                writer_decls += ['_fslMeshVertexWriter<{}, {}> {}{{&_fslMesh, {}(), 0u, false}};'.format(
+                    mesh_object, vertex_type, mesh_outputs['vertices'][1], vertex_type)]
+                writer_decls += ['_fslMeshPrimitiveWriter<{}, {}> {}{{&_fslMesh, {}(), 0u, false}};'.format(
+                    mesh_object, prim_type, mesh_outputs['primitives'][1], prim_type)]
+                writer_decls += ['_fslMeshIndexWriter<{}> {}{{&_fslMesh}};'.format(
+                    mesh_object, mesh_outputs['indices'][1])]
+                entry_declarations[0:0] = writer_decls
+            else:
+                if len(shader.struct_args) > 1:
+                    # MSL allows exactly one [[stage_in]] parameter, and a mesh pipeline's
+                    # fragment stage reads two structs: the per-vertex and the per-primitive
+                    # output. MSL takes that as a single struct nesting the two, so declare
+                    # the wrapper and alias its members back to the names the body uses.
+                    stage_in_type = '_fslStageIn_' + binary.filename.replace('.', '_')
+                    shader_src += ['struct ', stage_in_type, '\n{\n']
+                    for dtype, var in shader.struct_args:
+                        shader_src += ['\t', dtype, ' ', var, ';\n']
+                    shader_src += ['};\n']
+
+                shader_src += [msl_target, ' ', mtl_returntype, ' ', binary.filename.replace('.', '_'),  '(\n']
+                main_entry_line_index = len(shader_src)
+                prefix = '\t'
+                if len(shader.struct_args) > 1:
+                    shader_src += [prefix + stage_in_type + ' _fslStageIn[[stage_in]]\n']
+                    prefix = '\t,'
+                    entry_declarations[0:0] = ['{} {} = _fslStageIn.{};'.format(dtype, var, var)
+                                               for dtype, var in shader.struct_args]
+                else:
+                    for dtype, var in shader.struct_args:
+                        shader_src += [ prefix+dtype+' '+var+'[[stage_in]]\n']
+                        prefix = '\t,'
             for dtype, dvar in shader.flat_args:
                 if 'SV_OUTPUTCONTROLPOINTID' in dtype.upper(): continue
                 innertype = getMacro(dtype)
@@ -554,6 +784,32 @@ def metal(platform: Platforms, debug, binary: ShaderBinary, dst):
         if global_scope_count > 0:
             for ab, reGr in reGlobalResources:
                 line = reGr.sub(ab, line)
+
+        # SetMeshOutputCounts(numVertices, numPrimitives) -> set_primitive_count. MSL has no
+        # vertex-count setter: a vertex nothing indexes is simply never fetched. The vertex
+        # argument is still evaluated, in place, so an expression with a side effect keeps
+        # it, and the call is rewritten where it stands rather than moved -- the source
+        # decides whether it is reached, and hardware needs it out of divergent flow.
+        if shader.stage == Stages.MESH and 'SetMeshOutputCounts(' in line:
+            l_call = line.find('SetMeshOutputCounts(')
+            l_open = line.find('(', l_call)
+            l_close, counter = -1, 0
+            for j, c in enumerate(line[l_open:]):
+                if c == '(':
+                    counter += 1
+                if c == ')':
+                    counter -= 1
+                    if counter == 0:
+                        l_close = l_open + j
+                        break
+            fsl_assert(l_close > 0, fi, line_index,
+                       message='SetMeshOutputCounts must be a single-line call')
+            counts = getMacro(line[l_call:l_close+1])
+            fsl_assert(type(counts) == list and len(counts) == 2, fi, line_index,
+                       message='SetMeshOutputCounts takes a vertex and a primitive count')
+            line = line[:l_call] + '((void)({}), _fslMesh.set_primitive_count({}))'.format(
+                counts[0], counts[1]) + line[l_close+1:]
+
         if 'INIT_MAIN' in line:
 
             for entry_declaration in entry_declarations:
@@ -583,9 +839,17 @@ def metal(platform: Platforms, debug, binary: ShaderBinary, dst):
                             l_close = l_open + j
                             break
 
+            # The element a mesh thread last wrote is still staged, so it is stored on the
+            # way out. A thread that wrote nothing stores nothing.
+            mesh_flush = ''
+            if shader.stage == Stages.MESH:
+                mesh_return_seen = True
+                mesh_flush = '{}.flush(); {}.flush(); '.format(
+                    mesh_outputs['vertices'][1], mesh_outputs['primitives'][1])
+
             if l_close > 0:
                 if not shader.returnType:
-                    line = line[:l_ret] + '{ return; }' + line[l_close+1:]
+                    line = line[:l_ret] + '{ ' + mesh_flush + 'return; }' + line[l_close+1:]
                 else:
                     line = line[:l_ret] + '{ return ' + line[l_open+1:l_close].strip() + '; }' + line[l_close+1:]
 
@@ -595,6 +859,8 @@ def metal(platform: Platforms, debug, binary: ShaderBinary, dst):
 
                 # void entry, return nothing
                 if not shader.returnType:
+                    if mesh_flush:
+                        return_statement += [ws+'\t'+mesh_flush.strip()+'\n']
                     return_statement += [ws+'\treturn;\n']
 
                 else:
@@ -614,6 +880,12 @@ def metal(platform: Platforms, debug, binary: ShaderBinary, dst):
             continue;
 
         shader_src += [line]
+
+    # The staged mesh output is stored at RETURN, so a mesh entry that falls off its end
+    # would drop whatever the last write left staged.
+    if shader.stage == Stages.MESH:
+        fsl_assert(mesh_return_seen, binary.filename,
+                   message='mesh entry must end in RETURN() so its output is stored')
 
     shader_src += ['\n']
 

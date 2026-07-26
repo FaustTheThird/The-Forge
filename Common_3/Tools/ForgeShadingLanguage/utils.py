@@ -327,6 +327,12 @@ class Shader:
     stage = Stages.NONE
     struct_args = []
     flat_args = []
+    # Mesh/amplification entry outputs, as (kind, dtype, name, count) with kind one of
+    # 'vertices' / 'indices' / 'primitives' / 'payload'. HLSL takes these as entry
+    # parameters and needs no further handling, so the D3D generators ignore this; MSL
+    # has no such parameters -- the arrays turn into one mesh<> object -- so the Metal
+    # generator reconstructs the output shape from here.
+    mesh_outputs = []
     returnType = None
     defines = {}
     cBuffers = {}
@@ -424,21 +430,20 @@ def getShader(platform: Platforms, binary: ShaderBinary, fsl: list, dst=None, li
     # returnStruct = None
     struct_args = []
     flat_args = []
+    mesh_outputs = []
     for i, arg in enumerate(entry_args):
 
         arg_elements = arg.split()
 
-        # BloomEngine M6.6 D.1: mesh-shader entry args carry multi-
-        # token qualifiers that the FSL emitter must pass through to
-        # HLSL verbatim. Recognise the four canonical mesh-shader
-        # signatures and skip the regular flat/struct classification
-        # (the downstream `_MAIN(` text-replace in d3d.py does nothing
-        # for these since neither flat_args nor struct_args holds them):
-        #   out vertices T Name[N]    -- MS vertex output array
-        #   out indices  uint3 Name[N] -- MS triangle output array
-        #   out primitives T Name[N]  -- MS primitive output array
-        #   in  payload  T Name        -- MS payload input (matches
-        #                                 the AS's DispatchMesh payload)
+        # Mesh-shader entry args carry multi-token qualifiers that HLSL takes verbatim, so
+        # they are kept out of the regular flat/struct classification (the `_MAIN(`
+        # text-replace in d3d.py does nothing for an arg held by neither list). They are
+        # recorded instead, because MSL has no equivalent parameters and the Metal
+        # generator has to rebuild the output shape from them:
+        #   out vertices   T     Name[N] -- MS vertex output array
+        #   out indices    uintK Name[N] -- MS index output array (K = indices/primitive)
+        #   out primitives T     Name[N] -- MS per-primitive output array
+        #   in  payload    T     Name    -- MS payload input, matching the AS's DispatchMesh
         if stage in (Stages.MESH, Stages.TASK):
             if len(arg_elements) >= 4:
                 head = arg_elements[0].lower(), arg_elements[1].lower()
@@ -446,6 +451,11 @@ def getShader(platform: Platforms, binary: ShaderBinary, fsl: list, dst=None, li
                             ('out', 'indices'),
                             ('out', 'primitives'),
                             ('in',  'payload')):
+                    decl_name = ' '.join(arg_elements[3:]).replace(' ', '')
+                    mesh_outputs += [(head[1],
+                                      arg_elements[2],
+                                      getArrayBaseName(decl_name),
+                                      getArrayLenFlat(decl_name) if isArray(decl_name) else '')]
                     continue
 
         fsl_assert(len(arg_elements) == 2, fsl_path, message=': error FSL: Invalid entry argument: \''+arg+'\'')
@@ -486,6 +496,7 @@ def getShader(platform: Platforms, binary: ShaderBinary, fsl: list, dst=None, li
     shader.stage = stage
     shader.flat_args = flat_args
     shader.struct_args = struct_args
+    shader.mesh_outputs = mesh_outputs
 
     shader.returnType = entry_ret if entry_ret != 'void' else None
     shader.cBuffers = cbuffers

@@ -189,24 +189,26 @@ def main():
             bin_dir = os.path.join(args.binaryDestination, platform.name)
             os.makedirs(bin_dir, exist_ok=True)
 
-            # The MSL generator maps only VERT/FRAG/COMP to an entry-point qualifier
-            # (generators/metal.py targetToMslEntry), so mesh and amplification stages have no
-            # Metal path yet. Skip them with a warning rather than aborting: a shader list shared
-            # with the D3D12 build still declares them, and the rest of the list must keep
-            # compiling. A pixel stage named after a skipped mesh stage goes with it -- the list
-            # pairs the stages of a pipeline by base name, and such a pixel shader reads the mesh
-            # stage's per-vertex AND per-primitive outputs, which MSL can only take as a single
-            # stage_in struct that the mesh generator has to synthesise.
-            skip_mesh_pipelines = platform in (Platforms.MACOS, Platforms.IOS)
-            mesh_pipelines = set()
-            if skip_mesh_pipelines:
-                mesh_pipelines = {os.path.splitext(b.filename)[0] for b in binary_declarations
-                                  if b.stage in (Stages.MESH, Stages.TASK)}
+            # A stage the target's generator cannot emit is skipped with a warning rather
+            # than aborting: a shader list shared with another backend still declares it,
+            # and the rest of the list must keep compiling. The set is asked of the
+            # generator, so a stage stops being skipped the moment it is implemented.
+            # A pixel stage named after a skipped mesh stage goes with it -- the list pairs
+            # the stages of a pipeline by base name, and such a pixel shader reads the mesh
+            # stage's per-vertex AND per-primitive outputs, which only the mesh generator
+            # knows how to fold into MSL's single stage_in struct.
+            unsupported_stages = set()
+            if platform in (Platforms.MACOS, Platforms.IOS):
+                from generators.metal import targetToMslEntry
+                unsupported_stages = {stage for stage in (Stages.MESH, Stages.TASK)
+                                      if stage not in targetToMslEntry}
+            skipped_pipelines = {os.path.splitext(b.filename)[0] for b in binary_declarations
+                                 if b.stage in unsupported_stages}
 
             for binary in binary_declarations:
-                if skip_mesh_pipelines and (binary.stage in (Stages.MESH, Stages.TASK) or
-                        (binary.stage is Stages.FRAG and
-                         os.path.splitext(binary.filename)[0] in mesh_pipelines)):
+                if binary.stage in unsupported_stages or (
+                        binary.stage is Stages.FRAG and
+                        os.path.splitext(binary.filename)[0] in skipped_pipelines):
                     print('FSL: WARNING: {}: {} stage has no {} generator, skipping'.format(
                         binary.filename, binary.stage.name, platform.name))
                     continue

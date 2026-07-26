@@ -123,13 +123,21 @@ def util_spirv_target(features, binary: ShaderBinary):
     return 'spirv1.0' # vulkan1.0 default
 
 def util_shadertarget_metal(platform : Platforms, binary: ShaderBinary):
+    # Returns the whole -std= value, because Metal 3 changed how the standard is spelled:
+    # the platform-qualified form (macos-metal2.4, ios-metal2.4) stops at 2.4 and the
+    # Metal 3 standards are unqualified (metal3.0 and up). Mesh and amplification stages
+    # need Metal 3 -- the [[mesh]] attribute and the mesh<> type do not exist below it --
+    # so the version and its spelling are chosen together, per shader.
+    if binary.stage in (Stages.MESH, Stages.TASK):
+        return 'metal3.0'
+    qualifier = 'ios-metal' if platform == Platforms.IOS else 'macos-metal'
     if Features.RAYTRACING in binary.features or \
         Features.ATOMICS_64 in binary.features:
-        return '2.4'
+        return qualifier + '2.4'
     if platform == Platforms.IOS:
         if WaveopsFlags.WAVE_OPS_ARITHMETIC_BIT in binary.waveops_flags or Features.PRIM_ID in binary.features:
-            return '2.3'
-    return '2.3' # default
+            return qualifier + '2.3'
+    return qualifier + '2.3' # default
 
 def compile_binary(platform: Platforms, debug: bool, binary: ShaderBinary, src, dst):
     
@@ -289,7 +297,7 @@ def compile_binary(platform: Platforms, debug: bool, binary: ShaderBinary, src, 
             if Features.INVARIANT in binary.features:
                 params += ['-fpreserve-invariance']
 
-            params += [f"-std=macos-metal{util_shadertarget_metal(platform, binary)}"]
+            params += [f"-std={util_shadertarget_metal(platform, binary)}"]
             params += ['-Wno-unused-variable']
 
             if debug and os.name != 'nt':
@@ -314,7 +322,7 @@ def compile_binary(platform: Platforms, debug: bool, binary: ShaderBinary, src, 
             if Features.INVARIANT in binary.features:
                 params += ['-fpreserve-invariance']
 
-            params += [f"-std=ios-metal{util_shadertarget_metal(platform, binary)}"]
+            params += [f"-std={util_shadertarget_metal(platform, binary)}"]
             params += ['-Wno-unused-variable']
 
             if debug and os.name != 'nt':
