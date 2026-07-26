@@ -2562,6 +2562,11 @@ typedef struct GpuDesc
     id<MTLCounterSet> pCounterSetTimestamp;
     uint32_t          mDrawBoundarySamplingSupported : 1;
     uint32_t          mStageBoundarySamplingSupported : 1;
+    // Whether this device can run object/mesh pipelines. The other backends carry no such
+    // bit -- D3D12 exposes the tier through its own feature query and a caller reads it
+    // there -- so this is Metal's answer to the same question, probed once with the rest
+    // of the device's capabilities instead of at every would-be mesh pipeline.
+    uint32_t          mMeshShaderSupported : 1;
 #endif
 
     FormatCapability mFormatCaps[TinyImageFormat_Count];

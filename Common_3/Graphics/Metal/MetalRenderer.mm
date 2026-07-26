@@ -391,6 +391,121 @@ void util_barrier_update(Cmd* pCmd, const QueueType& encoderType);
 void util_barrier_required(Cmd* pCmd, const QueueType& encoderType);
 void util_bind_root_buffer(Cmd* pCmd, const RootDescriptorHandle* pHandle, uint32_t stages);
 
+#if defined(ENABLE_MESH_SHADER)
+// The object/mesh half of cmdBindDescriptorSet. A mesh pipeline drives the same render
+// encoder as a graphics one and keeps the fragment stage, so the shared body below still
+// does every setFragment* bind; what it cannot do is the vertex stage's twin, because a
+// mesh pipeline has no vertex stage -- it has the object + mesh pair, reached through
+// setObject*/setMesh*. Kept as one annotated function so the availability of the whole
+// mesh API is stated once instead of guarded per call. Reached only under
+// MTL_MESH_SHADER_RUNTIME, which is also what let the mesh pipeline be created at all.
+API_AVAILABLE(macos(13.0), ios(16.0))
+static void util_bind_descriptor_set_mesh_stages(Cmd* pCmd, uint32_t index, DescriptorSet* pDescriptorSet, uint32_t stages)
+{
+    if (pDescriptorSet->pRootDescriptorData)
+    {
+        RootDescriptorData* pData = pDescriptorSet->pRootDescriptorData + index;
+        for (uint32_t i = 0; i < pDescriptorSet->mRootBufferCount; ++i)
+        {
+            const RootDescriptorHandle* pHandle = &pData->pBuffers[i];
+            if (pHandle->mAccelerationStructure || !pHandle->mNonABResource)
+            {
+                continue;
+            }
+            if (stages & SHADER_STAGE_TASK)
+            {
+                [pCmd->pRenderEncoder setObjectBuffers:pHandle->pArr
+                                               offsets:pHandle->pOffsets
+                                             withRange:NSMakeRange(pHandle->mBinding, pHandle->mCount)];
+            }
+            if (stages & SHADER_STAGE_MESH)
+            {
+                [pCmd->pRenderEncoder setMeshBuffers:pHandle->pArr
+                                             offsets:pHandle->pOffsets
+                                           withRange:NSMakeRange(pHandle->mBinding, pHandle->mCount)];
+            }
+        }
+
+        for (uint32_t i = 0; i < pDescriptorSet->mRootTextureCount; ++i)
+        {
+            const RootDescriptorHandle* pHandle = &pData->pTextures[i];
+            if (!pHandle->mNonABResource)
+            {
+                continue;
+            }
+            if (stages & SHADER_STAGE_TASK)
+            {
+                [pCmd->pRenderEncoder setObjectTextures:pHandle->pArr withRange:NSMakeRange(pHandle->mBinding, pHandle->mCount)];
+            }
+            if (stages & SHADER_STAGE_MESH)
+            {
+                [pCmd->pRenderEncoder setMeshTextures:pHandle->pArr withRange:NSMakeRange(pHandle->mBinding, pHandle->mCount)];
+            }
+        }
+
+        for (uint32_t i = 0; i < pDescriptorSet->mRootSamplerCount; ++i)
+        {
+            const RootDescriptorHandle* pHandle = &pData->pSamplers[i];
+            if (!pHandle->mNonABResource)
+            {
+                continue;
+            }
+            if (stages & SHADER_STAGE_TASK)
+            {
+                [pCmd->pRenderEncoder setObjectSamplerStates:pHandle->pArr
+                                                   withRange:NSMakeRange(pHandle->mBinding, pHandle->mCount)];
+            }
+            if (stages & SHADER_STAGE_MESH)
+            {
+                [pCmd->pRenderEncoder setMeshSamplerStates:pHandle->pArr
+                                                 withRange:NSMakeRange(pHandle->mBinding, pHandle->mCount)];
+            }
+        }
+    }
+
+    if (pDescriptorSet->mArgumentBuffer)
+    {
+        const id<MTLBuffer> buffer = pDescriptorSet->mArgumentBuffer->pBuffer;
+        const uint64_t      offset = pDescriptorSet->mArgumentBuffer->mOffset + index * pDescriptorSet->mStride;
+
+        if (stages & SHADER_STAGE_TASK)
+        {
+            [pCmd->pRenderEncoder setObjectBuffer:buffer offset:offset atIndex:pDescriptorSet->mNodeIndex];
+        }
+        if (stages & SHADER_STAGE_MESH)
+        {
+            [pCmd->pRenderEncoder setMeshBuffer:buffer offset:offset atIndex:pDescriptorSet->mNodeIndex];
+        }
+
+        // Residency for what the argument buffer points at. The stage-less useResource /
+        // useHeap predate the object and mesh stages, so a mesh pipeline names its stages
+        // instead of relying on what "every stage" meant before those two existed. The
+        // shared body skips its stage-less call for the same reason.
+        const MTLRenderStages meshStages = MTLRenderStageObject | MTLRenderStageMesh | MTLRenderStageFragment;
+        [pCmd->pRenderEncoder useHeaps:pCmd->pRenderer->pHeaps count:pCmd->pRenderer->mHeapCount stages:meshStages];
+
+        const UntrackedResourceData* untracked = pDescriptorSet->ppUntrackedData[index];
+        if (untracked)
+        {
+            if (untracked->mData.mCount)
+            {
+                [pCmd->pRenderEncoder useResources:untracked->mData.pResources
+                                             count:untracked->mData.mCount
+                                             usage:MTLResourceUsageRead
+                                            stages:meshStages];
+            }
+            if (untracked->mRWData.mCount)
+            {
+                [pCmd->pRenderEncoder useResources:untracked->mRWData.pResources
+                                             count:untracked->mRWData.mCount
+                                             usage:MTLResourceUsageRead | MTLResourceUsageWrite
+                                            stages:meshStages];
+            }
+        }
+    }
+}
+#endif // ENABLE_MESH_SHADER
+
 void cmdBindDescriptorSet(Cmd* pCmd, uint32_t index, DescriptorSet* pDescriptorSet)
 {
     ASSERT(pCmd);
@@ -399,7 +514,30 @@ void cmdBindDescriptorSet(Cmd* pCmd, uint32_t index, DescriptorSet* pDescriptorS
 
     pCmd->mBoundDescriptorSets[pDescriptorSet->mNodeIndex] = pDescriptorSet;
     pCmd->mBoundDescriptorSetIndices[pDescriptorSet->mNodeIndex] = index;
-    uint8_t stages = (pCmd->pBoundPipeline->mType == PIPELINE_TYPE_COMPUTE) ? SHADER_STAGE_COMP : SHADER_STAGE_VERT | SHADER_STAGE_FRAG;
+    // Which shader stages this set has to reach, from the bound pipeline's kind. A mesh
+    // pipeline replaces the vertex stage with the object + mesh pair and keeps the fragment
+    // stage, so it takes its own setMesh*/setObject* setters rather than the vertex ones.
+    // Must be at least 32 bits wide: SHADER_STAGE_TASK is 0x100.
+    uint32_t stages = SHADER_STAGE_VERT | SHADER_STAGE_FRAG;
+    if (pCmd->pBoundPipeline->mType == PIPELINE_TYPE_COMPUTE)
+    {
+        stages = SHADER_STAGE_COMP;
+    }
+    else if (pCmd->pBoundPipeline->mType == PIPELINE_TYPE_MESH)
+    {
+        stages = SHADER_STAGE_MESH | SHADER_STAGE_TASK | SHADER_STAGE_FRAG;
+    }
+
+#if defined(ENABLE_MESH_SHADER)
+    if (stages & (SHADER_STAGE_MESH | SHADER_STAGE_TASK))
+    {
+        if (MTL_MESH_SHADER_RUNTIME)
+        {
+            util_bind_descriptor_set_mesh_stages(pCmd, index, pDescriptorSet, stages);
+        }
+    }
+#endif
+
     if (pDescriptorSet->pRootDescriptorData)
     {
         RootDescriptorData* pData = pDescriptorSet->pRootDescriptorData + index;
@@ -524,8 +662,10 @@ void cmdBindDescriptorSet(Cmd* pCmd, uint32_t index, DescriptorSet* pDescriptorS
                                                   usage:MTLResourceUsageRead | MTLResourceUsageWrite];
                 }
             }
-            else
+            else if (!(stages & SHADER_STAGE_MESH))
             {
+                // A mesh pipeline already made these resident above, naming the object and
+                // mesh stages the stage-less form does not know about.
                 if (untracked->mData.mCount)
                 {
                     [pCmd->pRenderEncoder useResources:untracked->mData.pResources
@@ -2224,6 +2364,17 @@ static void QueryGpuDesc(GpuDesc* pGpuDesc)
         pGpuDesc->mRaytracingSupported = pGpuDesc->mRayQuerySupported || pGpuDesc->mRayPipelineSupported;
     }
 #endif
+
+#if defined(ENABLE_MESH_SHADER)
+    // Object/mesh pipelines are a Metal 3 feature, and MTLGPUFamilyMetal3 is the family a
+    // device answers to exactly when it has them, so it is the whole gate -- there is no
+    // tier to read past it. The OS check is separate and just as necessary: the family
+    // exists on the device, the API that uses it arrived in macOS 13 / iOS 16.
+    if (MTL_MESH_SHADER_RUNTIME)
+    {
+        pGpuDesc->mMeshShaderSupported = [gpu supportsFamily:MTLGPUFamilyMetal3];
+    }
+#endif // ENABLE_MESH_SHADER
 
 #ifdef ENABLE_GPU_FAMILY_9
     pGpuDesc->m64BitAtomicsSupported = [pGpuDesc->pGPU supportsFamily:MTLGPUFamilyApple9];
@@ -4636,11 +4787,19 @@ void cmdExecuteIndirect(Cmd* pCmd, IndirectArgumentType type, uint maxCommandCou
         }
     }
 
-    static const uint32_t cmdStrides[3] = {
+    static const uint32_t cmdStrides[4] = {
         sizeof(IndirectDrawArguments),
         sizeof(IndirectDrawIndexArguments),
         sizeof(IndirectDispatchArguments),
+        sizeof(IndirectDispatchMeshArguments),
     };
+    // The indirect-command-buffer types carry no argument struct of their own: they are
+    // handled above on a device that supports ICBs, and there is nothing to execute here
+    // on one that does not. Returning keeps the stride lookup inside the table.
+    if ((uint32_t)type >= (uint32_t)INDIRECT_COMMAND_BUFFER)
+    {
+        return;
+    }
     const uint32_t stride = cmdStrides[type];
 
     if (type == INDIRECT_DRAW)
@@ -4715,6 +4874,38 @@ void cmdExecuteIndirect(Cmd* pCmd, IndirectArgumentType type, uint maxCommandCou
                                                      indirectBufferOffset:bufferOffset + stride * i
                                                     threadsPerThreadgroup:pCmd->pBoundPipeline->mNumThreadsPerGroup];
         }
+    }
+    else if (type == INDIRECT_DISPATCH_MESH)
+    {
+        ASSERT(pCmd->pBoundPipeline);
+        ASSERT(pCmd->pBoundPipeline->mType == PIPELINE_TYPE_MESH);
+
+#if defined(ENABLE_MESH_SHADER)
+        if (MTL_MESH_SHADER_RUNTIME)
+        {
+            // IndirectDispatchMeshArguments is D3D12_DISPATCH_MESH_ARGUMENTS: three group
+            // counts and nothing else, which is exactly what the buffer this reads holds.
+            // The per-stage thread counts are not in it on either backend -- D3D12 takes
+            // them from the shader's [numthreads], and here they come off the pipeline that
+            // carried them over from the same attribute, identically to cmdDispatchMesh.
+            const Pipeline* pPipeline = pCmd->pBoundPipeline;
+            MTLSize         objectThreads = MTLSizeMake(pPipeline->mObjectThreadsPerGroup[0], pPipeline->mObjectThreadsPerGroup[1],
+                                                        pPipeline->mObjectThreadsPerGroup[2]);
+            MTLSize         meshThreads = MTLSizeMake(pPipeline->mMeshThreadsPerGroup[0], pPipeline->mMeshThreadsPerGroup[1],
+                                                      pPipeline->mMeshThreadsPerGroup[2]);
+
+            for (uint32_t i = 0; i < maxCommandCount; ++i)
+            {
+                [pCmd->pRenderEncoder drawMeshThreadgroupsWithIndirectBuffer:pIndirectBuffer->pBuffer
+                                                       indirectBufferOffset:bufferOffset + stride * i
+                                                threadsPerObjectThreadgroup:objectThreads
+                                                  threadsPerMeshThreadgroup:meshThreads];
+            }
+            return;
+        }
+#endif
+
+        LOGF(eERROR, "cmdExecuteIndirect(INDIRECT_DISPATCH_MESH): mesh shaders require macOS 13 / iOS 16 or newer");
     }
 }
 
