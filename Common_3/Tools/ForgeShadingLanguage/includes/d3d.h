@@ -466,6 +466,13 @@ inline void StoreByte2(RWByteBuffer buff, uint address, uint2 val) { buff.Store2
 inline void StoreByte3(RWByteBuffer buff, uint address, uint3 val) { buff.Store3(address, val); }
 inline void StoreByte4(RWByteBuffer buff, uint address, uint4 val) { buff.Store4(address, val); }
 
+// Atomics addressed by BYTE offset into a byte buffer. AtomicAdd/AtomicMax take an lvalue, which a
+// RWByteAddressBuffer cannot hand out -- the operation is a method on the buffer here, while targets
+// that model a byte buffer as a uint array subscript it instead. These two spellings are the
+// portable form. Macros, not inline functions: the out-param has to reach the caller's variable.
+#define AtomicAddByte(BYTE_BUFFER, ADDRESS, VALUE, ORIGINAL_VALUE) (BYTE_BUFFER).InterlockedAdd((ADDRESS), (VALUE), (ORIGINAL_VALUE))
+#define AtomicMaxByte(BYTE_BUFFER, ADDRESS, VALUE, ORIGINAL_VALUE) (BYTE_BUFFER).InterlockedMax((ADDRESS), (VALUE), (ORIGINAL_VALUE))
+
 #define _DECL_SampleLvlTexCube(TYPE) \
 inline TYPE SampleLvlTexCube(TextureCube<TYPE> tex, SamplerState smp, float3 p, float l) \
 { return tex.SampleLevel(smp, p, l); }

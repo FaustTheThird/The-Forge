@@ -322,6 +322,11 @@ void AtomicMaxU64(device uint64_t& DEST, ulong VALUE)
 #define BeginNonUniformResourceIndex(X, Y) { uint __resourceIndex = X; uint X = min(__resourceIndex, Y-1U);
 #define EndNonUniformResourceIndex() }
 
+// Apple GPUs index an argument buffer with a divergent value directly, so the wave-scalarisation
+// hint is a no-op here -- same expansion d3d.h already uses on the console targets. Unlike the
+// Begin/End block form above this does not clamp the index, so it stays semantics-preserving.
+#define NonUniformResourceIndex(X) (X)
+
 #define frac fract
 #define lerp mix
 #define mul(X, Y) ((X) * (Y))
@@ -433,6 +438,13 @@ int2 GetDimensions(const texturecube<T, A> t, uint _NO_SAMPLER)
 #define StoreByte3(BYTE_BUFFER, ADDRESS, VALUE) (BYTE_BUFFER)[((ADDRESS) >> 2) + 0] = VALUE[0]; (BYTE_BUFFER)[((ADDRESS) >> 2) + 1] = VALUE[1]; (BYTE_BUFFER)[((ADDRESS) >> 2) + 2] = VALUE[2];
 #define StoreByte4(BYTE_BUFFER, ADDRESS, VALUE) (BYTE_BUFFER)[((ADDRESS) >> 2) + 0] = VALUE[0]; (BYTE_BUFFER)[((ADDRESS) >> 2) + 1] = VALUE[1]; (BYTE_BUFFER)[((ADDRESS) >> 2) + 2] = VALUE[2]; (BYTE_BUFFER)[((ADDRESS) >> 2) + 3] = VALUE[3];
 
+// Atomics addressed by BYTE offset into a byte buffer. AtomicAdd/AtomicMax take an lvalue, which a
+// D3D RWByteAddressBuffer cannot hand out -- there the operation is a method on the buffer instead.
+// These two spellings are the portable form; a byte buffer is a plain uint array here, so the byte
+// offset just becomes an element index.
+#define AtomicAddByte(BYTE_BUFFER, ADDRESS, VALUE, ORIGINAL_VALUE) AtomicAdd((BYTE_BUFFER)[(ADDRESS) >> 2u], (VALUE), (ORIGINAL_VALUE))
+#define AtomicMaxByte(BYTE_BUFFER, ADDRESS, VALUE, ORIGINAL_VALUE) AtomicMax((BYTE_BUFFER)[(ADDRESS) >> 2u], (VALUE), (ORIGINAL_VALUE))
+
 // #define asfloat(X) as_type<float>(X)
 inline float asfloat(uint X) { return as_type<float>(X); }
 inline float2 asfloat(uint2 X) { return as_type<float2>(X); }
@@ -442,6 +454,15 @@ inline uint asuint(float X) { return as_type<uint>(X); }
 inline uint2 asuint(float2 X) { return as_type<uint2>(X); }
 inline uint3 asuint(float3 X) { return as_type<uint3>(X); }
 inline uint4 asuint(float4 X) { return as_type<uint4>(X); }
+// HLSL has asint as a builtin, so shaders written against it need the counterpart here.
+inline int asint(float X) { return as_type<int>(X); }
+inline int2 asint(float2 X) { return as_type<int2>(X); }
+inline int3 asint(float3 X) { return as_type<int3>(X); }
+inline int4 asint(float4 X) { return as_type<int4>(X); }
+inline int asint(uint X) { return as_type<int>(X); }
+inline int2 asint(uint2 X) { return as_type<int2>(X); }
+inline int3 asint(uint3 X) { return as_type<int3>(X); }
+inline int4 asint(uint4 X) { return as_type<int4>(X); }
 
 #define TexCube(ELEM_TYPE) texturecube<METAL_T(ELEM_TYPE), access::sample>
 #define TexCubeArray(ELEM_TYPE) texturecube_array<METAL_T(ELEM_TYPE), access::sample>

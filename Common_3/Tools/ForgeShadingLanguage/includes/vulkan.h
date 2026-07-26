@@ -233,6 +233,13 @@ textureLodOffset(sampler3D(NAME, SAMPLER), COORD, LEVEL, OFFSET)
 #define StoreByte3(BYTE_BUFFER, ADDRESS, VALUE) (BYTE_BUFFER)[((ADDRESS) >> 2) + 0] = VALUE[0]; (BYTE_BUFFER)[((ADDRESS) >> 2) + 1] = VALUE[1]; (BYTE_BUFFER)[((ADDRESS) >> 2) + 2] = VALUE[2];
 #define StoreByte4(BYTE_BUFFER, ADDRESS, VALUE) (BYTE_BUFFER)[((ADDRESS) >> 2) + 0] = VALUE[0]; (BYTE_BUFFER)[((ADDRESS) >> 2) + 1] = VALUE[1]; (BYTE_BUFFER)[((ADDRESS) >> 2) + 2] = VALUE[2]; (BYTE_BUFFER)[((ADDRESS) >> 2) + 3] = VALUE[3];
 
+// Atomics addressed by BYTE offset into a byte buffer. AtomicAdd/AtomicMax take an lvalue, which a
+// D3D RWByteAddressBuffer cannot hand out -- there the operation is a method on the buffer instead.
+// These two spellings are the portable form; a byte buffer is a plain uint array here, so the byte
+// offset just becomes an element index. AtomicMax has no out-param form here, hence the assignment.
+#define AtomicAddByte(BYTE_BUFFER, ADDRESS, VALUE, ORIGINAL_VALUE) AtomicAdd((BYTE_BUFFER)[(ADDRESS) >> 2], (VALUE), (ORIGINAL_VALUE))
+#define AtomicMaxByte(BYTE_BUFFER, ADDRESS, VALUE, ORIGINAL_VALUE) {(ORIGINAL_VALUE) = atomicMax((BYTE_BUFFER)[(ADDRESS) >> 2], (VALUE));}
+
 // #define LoadLvlTex2D(TEX, SMP, P, L) _LoadLvlTex2D(TEX, SMP, ivec2((P).xy), L)
 // vec4 _LoadLvlTex2D(texture2D TEX, sampler SMP, ivec2 P, int L) { return texelFetch(sampler2D(TEX, SMP), P, L); }
 // #ifdef GL_EXT_samplerless_texture_functions
