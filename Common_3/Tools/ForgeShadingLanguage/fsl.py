@@ -189,13 +189,24 @@ def main():
             bin_dir = os.path.join(args.binaryDestination, platform.name)
             os.makedirs(bin_dir, exist_ok=True)
 
+            # The MSL generator maps only VERT/FRAG/COMP to an entry-point qualifier
+            # (generators/metal.py targetToMslEntry), so mesh and amplification stages have no
+            # Metal path yet. Skip them with a warning rather than aborting: a shader list shared
+            # with the D3D12 build still declares them, and the rest of the list must keep
+            # compiling. A pixel stage named after a skipped mesh stage goes with it -- the list
+            # pairs the stages of a pipeline by base name, and such a pixel shader reads the mesh
+            # stage's per-vertex AND per-primitive outputs, which MSL can only take as a single
+            # stage_in struct that the mesh generator has to synthesise.
+            skip_mesh_pipelines = platform in (Platforms.MACOS, Platforms.IOS)
+            mesh_pipelines = set()
+            if skip_mesh_pipelines:
+                mesh_pipelines = {os.path.splitext(b.filename)[0] for b in binary_declarations
+                                  if b.stage in (Stages.MESH, Stages.TASK)}
+
             for binary in binary_declarations:
-                # The MSL generator maps only VERT/FRAG/COMP to an entry-point qualifier
-                # (generators/metal.py targetToMslEntry), so mesh and amplification stages
-                # have no Metal path yet. Skip them with a warning rather than aborting: a
-                # shader list shared with the D3D12 build still declares them, and the rest
-                # of the list must keep compiling.
-                if platform in (Platforms.MACOS, Platforms.IOS) and binary.stage in (Stages.MESH, Stages.TASK):
+                if skip_mesh_pipelines and (binary.stage in (Stages.MESH, Stages.TASK) or
+                        (binary.stage is Stages.FRAG and
+                         os.path.splitext(binary.filename)[0] in mesh_pipelines)):
                     print('FSL: WARNING: {}: {} stage has no {} generator, skipping'.format(
                         binary.filename, binary.stage.name, platform.name))
                     continue
