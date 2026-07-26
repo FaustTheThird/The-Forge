@@ -1864,6 +1864,10 @@ typedef struct Shader
         id<MTLFunction> pVertexShader;
         id<MTLFunction> pFragmentShader;
         id<MTLFunction> pComputeShader;
+        // The mesh stage and, when a mesh pipeline amplifies, the object stage that feeds
+        // it -- MSL's spelling of the mesh and task stages.
+        id<MTLFunction> pMeshShader;
+        id<MTLFunction> pObjectShader;
         uint32_t        mTessellation : 1;
         uint32_t        mICB : 1;
     };
@@ -2149,7 +2153,10 @@ typedef struct DEFINE_ALIGNED(Pipeline, ALIGN_Pipeline)
         id<MTLDepthStencilState>    pDepthStencilState;
         union
         {
-            // Graphics
+            // Graphics, and mesh: a mesh pipeline is rasterised through the same render
+            // encoder and needs the same state, plus the mesh threadgroup size that
+            // drawMeshThreadgroups takes as an argument. It fits beside the graphics
+            // fields without growing the union, which the compute MTLSize already sizes.
             struct
             {
                 uint32_t mCullMode : 3;
@@ -2162,6 +2169,8 @@ typedef struct DEFINE_ALIGNED(Pipeline, ALIGN_Pipeline)
                 uint32_t mTessellation : 1;
                 float    mDepthBias;
                 float    mSlopeScale;
+                uint16_t mMeshThreadsPerGroup[3];
+                uint16_t mObjectThreadsPerGroup[3];
             };
             // Compute
             struct

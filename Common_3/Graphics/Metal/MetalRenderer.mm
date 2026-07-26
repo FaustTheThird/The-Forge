@@ -3323,8 +3323,27 @@ void addShaderBinary(Renderer* pRenderer, const BinaryShaderDesc* pDesc, Shader*
                 compiled_code = &(pShaderProgram->pComputeShader);
             }
             break;
+            case SHADER_STAGE_MESH:
+            {
+                pStage = &pDesc->mMesh;
+                compiled_code = &(pShaderProgram->pMeshShader);
+            }
+            break;
+            case SHADER_STAGE_TASK:
+            {
+                pStage = &pDesc->mTask;
+                compiled_code = &(pShaderProgram->pObjectShader);
+            }
+            break;
             default:
                 break;
+            }
+
+            // A stage with no MSL mapping leaves both null and must not be loaded as if it
+            // had one -- the loop would read whichever BinaryShaderStageDesc came last.
+            if (!pStage || !compiled_code)
+            {
+                continue;
             }
 
             // Create a MTLLibrary from bytecode.
@@ -3363,6 +3382,16 @@ void addShaderBinary(Renderer* pRenderer, const BinaryShaderDesc* pDesc, Shader*
         }
     }
 
+    // The mesh stage's threadgroup size is an argument to drawMeshThreadgroups, so it is
+    // carried on the shader and copied into the pipeline that uses it.
+    if (pShaderProgram->mStages & SHADER_STAGE_MESH)
+    {
+        for (size_t i = 0; i < 3; ++i)
+        {
+            pShaderProgram->mNumThreadsPerGroup[i] = pDesc->mMesh.mNumThreadsPerGroup[i];
+        }
+    }
+
     if (pShaderProgram->pVertexShader)
     {
         pShaderProgram->mTessellation = pShaderProgram->pVertexShader.patchType != MTLPatchTypeNone;
@@ -3378,6 +3407,8 @@ void removeShader(Renderer* pRenderer, Shader* pShaderProgram)
     pShaderProgram->pVertexShader = nil;
     pShaderProgram->pFragmentShader = nil;
     pShaderProgram->pComputeShader = nil;
+    pShaderProgram->pMeshShader = nil;
+    pShaderProgram->pObjectShader = nil;
     SAFE_FREE(pShaderProgram);
 }
 void addGraphicsPipelineImpl(Renderer* pRenderer, const char* pName, const GraphicsPipelineDesc* pDesc, Pipeline** ppPipeline)
@@ -3579,6 +3610,98 @@ void addGraphicsPipelineImpl(Renderer* pRenderer, const char* pName, const Graph
     *ppPipeline = pPipeline;
 }
 
+#if defined(ENABLE_MESH_SHADER)
+// Annotated rather than guarded internally: the availability check belongs at the one call
+// site, and marking the function lets its body use the mesh API without a guard per line.
+API_AVAILABLE(macos(13.0), ios(16.0))
+void addMeshPipelineImpl(Renderer* pRenderer, const char* pName, const MeshPipelineDesc* pDesc, Pipeline** ppPipeline)
+{
+    ASSERT(pRenderer);
+    ASSERT(pRenderer->pDevice != nil);
+    ASSERT(pDesc);
+    ASSERT(pDesc->pShaderProgram);
+    ASSERT(pDesc->pShaderProgram->mStages & SHADER_STAGE_MESH);
+    ASSERT(ppPipeline);
+
+    Pipeline* pPipeline = (Pipeline*)tf_calloc_memalign(1, alignof(Pipeline), sizeof(Pipeline));
+    ASSERT(pPipeline);
+
+    pPipeline->mType = PIPELINE_TYPE_MESH;
+
+    // A mesh pipeline has no input assembler: the mesh stage generates the vertices and its
+    // own topology, so there is no vertex descriptor and no primitive type to select at the
+    // draw call. Everything downstream of the rasteriser is the same as a graphics pipeline.
+    MTLMeshRenderPipelineDescriptor* meshPipelineDesc = [[MTLMeshRenderPipelineDescriptor alloc] init];
+    meshPipelineDesc.objectFunction = pDesc->pShaderProgram->pObjectShader;
+    meshPipelineDesc.meshFunction = pDesc->pShaderProgram->pMeshShader;
+    meshPipelineDesc.fragmentFunction = pDesc->pShaderProgram->pFragmentShader;
+    meshPipelineDesc.rasterSampleCount = pDesc->mSampleCount;
+
+    if (pDesc->pBlendState)
+    {
+        util_to_blend_desc(pDesc->pBlendState, meshPipelineDesc.colorAttachments, pDesc->mRenderTargetCount);
+    }
+
+    for (uint32_t i = 0; i < pDesc->mRenderTargetCount; ++i)
+    {
+        meshPipelineDesc.colorAttachments[i].pixelFormat = (MTLPixelFormat)TinyImageFormat_ToMTLPixelFormat(pDesc->pColorFormats[i]);
+    }
+
+    const RasterizerStateDesc* pRasterizer = pDesc->pRasterizerState ? pDesc->pRasterizerState : &gDefaultRasterizerState;
+    pPipeline->mCullMode = (uint32_t)gMtlCullModeTranslator[pRasterizer->mCullMode];
+    pPipeline->mFillMode = (uint32_t)gMtlFillModeTranslator[pRasterizer->mFillMode];
+    pPipeline->mDepthBias = pRasterizer->mDepthBias;
+    pPipeline->mSlopeScale = pRasterizer->mSlopeScaledDepthBias;
+    pPipeline->mDepthClipMode = pRasterizer->mDepthClampEnable ? (uint32_t)MTLDepthClipModeClamp : (uint32_t)MTLDepthClipModeClip;
+    pPipeline->mWinding = (pRasterizer->mFrontFace == FRONT_FACE_CCW ? MTLWindingCounterClockwise : MTLWindingClockwise);
+
+    if (pDesc->mDepthStencilFormat != TinyImageFormat_UNDEFINED)
+    {
+        pPipeline->pDepthStencilState = pDesc->pDepthState ? util_to_depth_state(pRenderer, pDesc->pDepthState) : pDefaultDepthState;
+        MTLPixelFormat depthStencilFormat = (MTLPixelFormat)TinyImageFormat_ToMTLPixelFormat(pDesc->mDepthStencilFormat);
+        if (TinyImageFormat_HasDepth(pDesc->mDepthStencilFormat))
+        {
+            meshPipelineDesc.depthAttachmentPixelFormat = depthStencilFormat;
+        }
+        if (TinyImageFormat_HasStencil(pDesc->mDepthStencilFormat))
+        {
+            meshPipelineDesc.stencilAttachmentPixelFormat = depthStencilFormat;
+        }
+    }
+
+    // drawMeshThreadgroups takes the threads per threadgroup for both stages, where
+    // DispatchMesh reads them from the compiled shader. A pipeline with no object stage
+    // still has to pass a size, and one thread is the smallest legal grid.
+    const uint32_t* meshThreads = pDesc->pShaderProgram->mNumThreadsPerGroup;
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        pPipeline->mMeshThreadsPerGroup[i] = (uint16_t)max(1u, meshThreads[i]);
+        pPipeline->mObjectThreadsPerGroup[i] = 1;
+    }
+
+#if defined(ENABLE_GRAPHICS_DEBUG_ANNOTATION)
+    if (pName)
+    {
+        meshPipelineDesc.label = [NSString stringWithUTF8String:pName];
+    }
+#endif
+
+    NSError* error = nil;
+    pPipeline->pRenderPipelineState = [pRenderer->pDevice newRenderPipelineStateWithMeshDescriptor:meshPipelineDesc
+                                                                                           options:MTLPipelineOptionNone
+                                                                                        reflection:nil
+                                                                                             error:&error];
+    if (!pPipeline->pRenderPipelineState)
+    {
+        LOGF(LogLevel::eERROR, "Failed to create mesh render pipeline state, error:\n%s", [error.description UTF8String]);
+        SAFE_FREE(pPipeline);
+        return;
+    }
+
+    *ppPipeline = pPipeline;
+}
+#endif // ENABLE_MESH_SHADER
+
 void addComputePipelineImpl(Renderer* pRenderer, const char* pName, const ComputePipelineDesc* pDesc, Pipeline** ppPipeline)
 {
     ASSERT(pRenderer);
@@ -3633,6 +3756,18 @@ void addPipeline(Renderer* pRenderer, const PipelineDesc* pDesc, Pipeline** ppPi
     case (PIPELINE_TYPE_GRAPHICS):
     {
         addGraphicsPipelineImpl(pRenderer, pDesc->pName, &pDesc->mGraphicsDesc, ppPipeline);
+        break;
+    }
+    case (PIPELINE_TYPE_MESH):
+    {
+#if defined(ENABLE_MESH_SHADER)
+        if (MTL_MESH_SHADER_RUNTIME)
+        {
+            addMeshPipelineImpl(pRenderer, pDesc->pName, &pDesc->mMeshDesc, ppPipeline);
+            break;
+        }
+#endif
+        LOGF(LogLevel::eERROR, "Mesh pipelines require macOS 13 / iOS 16 or newer");
         break;
     }
     default:
@@ -4034,7 +4169,10 @@ void cmdBindPipeline(Cmd* pCmd, Pipeline* pPipeline)
 
     @autoreleasepool
     {
-        if (pPipeline->mType == PIPELINE_TYPE_GRAPHICS)
+        // A mesh pipeline binds through the same render encoder and carries the same
+        // rasteriser state; only the input assembler is absent, so there is no primitive
+        // type to select -- the mesh stage's own topology drives the rasteriser.
+        if (pPipeline->mType == PIPELINE_TYPE_GRAPHICS || pPipeline->mType == PIPELINE_TYPE_MESH)
         {
             [pCmd->pRenderEncoder setRenderPipelineState:pPipeline->pRenderPipelineState];
 
@@ -4049,7 +4187,10 @@ void cmdBindPipeline(Cmd* pCmd, Pipeline* pPipeline)
                 [pCmd->pRenderEncoder setDepthStencilState:pPipeline->pDepthStencilState];
             }
 
-            pCmd->mSelectedPrimitiveType = (uint32_t)pPipeline->mPrimitiveType;
+            if (pPipeline->mType == PIPELINE_TYPE_GRAPHICS)
+            {
+                pCmd->mSelectedPrimitiveType = (uint32_t)pPipeline->mPrimitiveType;
+            }
         }
         else if (pPipeline->mType == PIPELINE_TYPE_COMPUTE)
         {
@@ -4412,18 +4553,41 @@ void cmdDispatch(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t
     [pCmd->pComputeEncoder dispatchThreadgroups:threadgroupCount threadsPerThreadgroup:pCmd->pBoundPipeline->mNumThreadsPerGroup];
 }
 
-// BloomEngine M6.6 B.5: Metal mesh-shader bring-up deferred to M9+
-// (would map onto MTLMeshRenderPipelineDescriptor +
-// drawMeshThreadgroups). Stub so a stray cmdDispatchMesh call on Metal
-// fails loudly rather than silently no-op'ing.
 void cmdDispatchMesh(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
 {
-    UNREF_PARAM(pCmd);
+    ASSERT(pCmd);
+    ASSERT(pCmd->pBoundPipeline);
+    ASSERT(pCmd->pBoundPipeline->mType == PIPELINE_TYPE_MESH);
+
+    RebindState(pCmd);
+
+#if defined(ENABLE_MESH_SHADER)
+    if (MTL_MESH_SHADER_RUNTIME)
+    {
+        const Pipeline* pPipeline = pCmd->pBoundPipeline;
+
+        // The group counts are threadgroups of the mesh grid, the same quantity DispatchMesh
+        // takes. What DispatchMesh does not take, and this does, is the threads per
+        // threadgroup for each stage: on D3D12 they come from the shader's [numthreads],
+        // here they were carried onto the pipeline from the same attribute.
+        MTLSize threadgroupCount = MTLSizeMake(groupCountX, groupCountY, groupCountZ);
+        MTLSize objectThreads = MTLSizeMake(pPipeline->mObjectThreadsPerGroup[0], pPipeline->mObjectThreadsPerGroup[1],
+                                            pPipeline->mObjectThreadsPerGroup[2]);
+        MTLSize meshThreads = MTLSizeMake(pPipeline->mMeshThreadsPerGroup[0], pPipeline->mMeshThreadsPerGroup[1],
+                                          pPipeline->mMeshThreadsPerGroup[2]);
+
+        [pCmd->pRenderEncoder drawMeshThreadgroups:threadgroupCount
+                       threadsPerObjectThreadgroup:objectThreads
+                         threadsPerMeshThreadgroup:meshThreads];
+        return;
+    }
+#else
     UNREF_PARAM(groupCountX);
     UNREF_PARAM(groupCountY);
     UNREF_PARAM(groupCountZ);
-    LOGF(eERROR, "cmdDispatchMesh: Metal mesh-shader backend not implemented (M9+).");
-    ASSERTFAIL("cmdDispatchMesh: Metal stub hit");
+#endif
+
+    LOGF(eERROR, "cmdDispatchMesh: mesh shaders require macOS 13 / iOS 16 or newer");
 }
 
 void cmdExecuteIndirect(Cmd* pCmd, IndirectArgumentType type, uint maxCommandCount, Buffer* pIndirectBuffer, uint64_t bufferOffset,

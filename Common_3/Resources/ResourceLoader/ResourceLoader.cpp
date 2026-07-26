@@ -4176,7 +4176,10 @@ void addShader(Renderer* pRenderer, const ShaderLoadDesc* pDesc, Shader** ppShad
             pBinaryStageDesc->pEntryPoint = stages[i]->pEntryPointName;
         }
 
-        if (SHADER_STAGE_COMP == stage)
+        // A mesh stage carries a threadgroup size just like a compute stage does, and Metal
+        // needs it at the draw call: drawMeshThreadgroups takes the threads per mesh
+        // threadgroup explicitly, where DispatchMesh reads it from the compiled shader.
+        if (SHADER_STAGE_COMP == stage || SHADER_STAGE_MESH == stage || SHADER_STAGE_TASK == stage)
         {
             pBinaryStageDesc->mNumThreadsPerGroup[0] = metadata.mNumThreadsPerGroup[0];
             pBinaryStageDesc->mNumThreadsPerGroup[1] = metadata.mNumThreadsPerGroup[1];

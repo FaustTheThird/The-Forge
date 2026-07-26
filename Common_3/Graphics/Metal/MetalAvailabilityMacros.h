@@ -50,6 +50,7 @@
 #ifdef __IPHONE_16_0
 #if __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_16_0
 #define ENABLE_ACCELERATION_STRUCTURE_VERTEX_FORMAT
+#define ENABLE_MESH_SHADER
 #endif // __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_16_0
 #endif // __IPHONE_16_0
 
@@ -104,6 +105,7 @@
 #ifdef MAC_OS_VERSION_13_0
 #if MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_13_0
 #define ENABLE_ACCELERATION_STRUCTURE_VERTEX_FORMAT
+#define ENABLE_MESH_SHADER
 #define ENABLE_GPU_FAMILY_8
 #ifndef HIGHEST_GPU_FAMILY
 #define HIGHEST_GPU_FAMILY MTLGPUFamilyApple8
@@ -144,6 +146,11 @@
 #endif // TARGET_IOS
 
 #define MTL_RAYTRACING_SUPPORTED IOS17_RUNTIME
+
+// The mesh and object stages, MTLMeshRenderPipelineDescriptor and drawMeshThreadgroups all
+// arrived together in macOS 13 / iOS 16. ENABLE_MESH_SHADER says the SDK declares them;
+// this says the machine running the build's output has them.
+#define MTL_MESH_SHADER_RUNTIME @available(macOS 13.0, iOS 16.0, *)
 
 #ifdef ARGUMENT_ACCESS_DEPRECATED
 #define MTL_ACCESS_TYPE    MTLBindingAccess
