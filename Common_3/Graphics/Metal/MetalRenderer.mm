@@ -2463,8 +2463,11 @@ static bool SelectBestGpu(const RendererDesc* settings, Renderer* pRenderer)
     LOGF(LogLevel::eINFO, "Model id of selected gpu: %#x", pRenderer->pGpu->mGpuVendorPreset.mModelId);
     LOGF(LogLevel::eINFO, "Preset of selected gpu: %s", presetLevelToString(pRenderer->pGpu->mGpuVendorPreset.mPresetLevel));
 
+    // MTLArgumentBuffersTier1 is 0 and Tier2 is 1, so the raw enum reads one lower than the tier
+    // everyone quotes -- an Apple-family GPU printed "Tier: 1" and looked like it had lost half its
+    // descriptor capability. Print the human tier number.
     MTLArgumentBuffersTier abTier = pRenderer->pDevice.argumentBuffersSupport;
-    LOGF(LogLevel::eINFO, "Metal: Argument Buffer Tier: %lu", abTier);
+    LOGF(LogLevel::eINFO, "Metal: Argument Buffer Tier: %lu", (unsigned long)abTier + 1UL);
     LOGF(LogLevel::eINFO, "Metal: Max Arg Buffer Textures: %u", pRenderer->pGpu->mMaxBoundTextures);
 
     return true;
