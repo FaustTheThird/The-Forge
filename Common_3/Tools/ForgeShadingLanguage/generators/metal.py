@@ -564,22 +564,48 @@ def metal(platform: Platforms, debug, binary: ShaderBinary, dst):
             continue
 
         if re.search(r'(^|\s+)RETURN', line):
-            ws = get_whitespace(line)
-            return_statement = [ ws+'{\n' ]
+            # RETURN(...) can sit inline behind a guard, e.g. if (Cond) { RETURN(V); }. Replacing
+            # the whole line would drop that guard AND mis-slice the value, because getMacro takes
+            # the first parenthesised run on the line -- which is the condition, not the argument.
+            # So a RETURN that is not the first token is expanded where it stands, keeping the
+            # rest of the line; only a line that opens with RETURN is replaced wholesale.
+            l_ret = line.find('RETURN')
+            l_open = line.find('(', l_ret)
+            l_close = -1
+            if line[:l_ret].strip() and l_open > l_ret:
+                counter = 0
+                for j, c in enumerate(line[l_open:]):
+                    if c == '(':
+                        counter += 1
+                    if c == ')':
+                        counter -= 1
+                        if counter == 0:
+                            l_close = l_open + j
+                            break
 
-            # void entry, return nothing
-            if not shader.returnType:
-                return_statement += [ws+'\treturn;\n']
+            if l_close > 0:
+                if not shader.returnType:
+                    line = line[:l_ret] + '{ return; }' + line[l_close+1:]
+                else:
+                    line = line[:l_ret] + '{ return ' + line[l_open+1:l_close].strip() + '; }' + line[l_close+1:]
 
             else:
-                return_value = getMacro(line)
-                # entry declared with returntype, return var
-                return_statement += [ws+'\treturn '+return_value+';\n']
+                ws = get_whitespace(line)
+                return_statement = [ ws+'{\n' ]
 
-            return_statement += [ ws+'}\n' ]
-            shader_src += return_statement
-            shader_src += ['#line {}\n'.format(line_index), '//'+line]
-            continue
+                # void entry, return nothing
+                if not shader.returnType:
+                    return_statement += [ws+'\treturn;\n']
+
+                else:
+                    return_value = getMacro(line)
+                    # entry declared with returntype, return var
+                    return_statement += [ws+'\treturn '+return_value+';\n']
+
+                return_statement += [ ws+'}\n' ]
+                shader_src += return_statement
+                shader_src += ['#line {}\n'.format(line_index), '//'+line]
+                continue
 
         if shader_src_len != len(shader_src):
             shader_src += ['#line {}\n'.format(line_index)]
@@ -608,7 +634,6 @@ def metal(platform: Platforms, debug, binary: ShaderBinary, dst):
             if line.strip().startswith('//'): continue
 
             # modify signatures
-            l_call = line.find(fn+'(')
             if insert_line in line:
                 for parameter in signature_additions:
                     if line[insert_loc-1:insert_loc+1] == '()':
@@ -618,24 +643,34 @@ def metal(platform: Platforms, debug, binary: ShaderBinary, dst):
                 shader_src[i] = line
                 modified_signature = True
 
-            # modify calls
-            elif modified_signature and l_call > 0 and line[l_call-1] in ' =\t(!':
-                l2 = line.find(');', l_call)
-                l2 = 0
-                counter = 0
-                for j, c in enumerate(line[l_call+len(fn):]):
-                    if c == '(':
-                        counter+=1
-                        if counter == 1:
-                            l2 = j+l_call+len(fn)+1
-                            break
-                    if c == ')':
-                        counter-=1
-                for argument in call_additions:
-                    if line[l2-1:l2+1] == '()':
-                        line = line[:l2] + argument + line[l2:]
-                    else:
-                        line = line[:l2] + argument + ', ' + line[l2:]
+            # modify calls: EVERY call on the line, not just the first. Patching only the first
+            # leaves any further call on the same line at the old arity, e.g. all three calls in
+            # float3(F(B, 0u), F(B, 4u), F(B, 8u)). The insertion points are collected first and
+            # applied right-to-left so an earlier insertion cannot shift a later offset.
+            elif modified_signature:
+                call_sites = []
+                l_call = line.find(fn+'(')
+                while l_call > 0:
+                    if line[l_call-1] in ' =\t(!':
+                        counter = 0
+                        for j, c in enumerate(line[l_call+len(fn):]):
+                            if c == '(':
+                                counter+=1
+                                if counter == 1:
+                                    call_sites += [j+l_call+len(fn)+1]
+                                    break
+                            if c == ')':
+                                counter-=1
+                    l_call = line.find(fn+'(', l_call+1)
+                for l2 in reversed(call_sites):
+                    # call_additions is iterated forward here to match the order the signature
+                    # pass inserted signature_additions; reversing either one transposes the
+                    # arguments of any function that threads more than one resource reference.
+                    for argument in call_additions:
+                        if line[l2-1:l2+1] == '()':
+                            line = line[:l2] + argument + line[l2:]
+                        else:
+                            line = line[:l2] + argument + ', ' + line[l2:]
                 shader_src[i] = line
     
     # optimization pass for generated code
