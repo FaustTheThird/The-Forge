@@ -190,6 +190,15 @@ def main():
             os.makedirs(bin_dir, exist_ok=True)
 
             for binary in binary_declarations:
+                # The MSL generator maps only VERT/FRAG/COMP to an entry-point qualifier
+                # (generators/metal.py targetToMslEntry), so mesh and amplification stages
+                # have no Metal path yet. Skip them with a warning rather than aborting: a
+                # shader list shared with the D3D12 build still declares them, and the rest
+                # of the list must keep compiling.
+                if platform in (Platforms.MACOS, Platforms.IOS) and binary.stage in (Stages.MESH, Stages.TASK):
+                    print('FSL: WARNING: {}: {} stage has no {} generator, skipping'.format(
+                        binary.filename, binary.stage.name, platform.name))
+                    continue
                 job = (args, regen, binary, platform, dst_dir, bin_dir)
                 jobs[binary.stage] += [job]
     exit_code = 0

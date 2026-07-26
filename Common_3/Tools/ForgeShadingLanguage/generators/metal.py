@@ -55,6 +55,12 @@ def metal(platform: Platforms, debug, binary: ShaderBinary, dst):
     fsl = binary.preprocessed_srcs[platform]
 
     shader = getShader(platform, binary, fsl, dst)
+    # Only the stages in the table have an MSL entry-point qualifier; the mesh and
+    # amplification stages are not generated for Metal. fsl.py drops those declarations
+    # before they reach a generator, so this reports a real gap instead of a KeyError.
+    if shader.stage not in targetToMslEntry:
+        raise NotImplementedError('FSL: {} has no MSL generator for the {} stage'.format(
+            binary.filename, shader.stage.name))
     msl_target = targetToMslEntry[shader.stage]
     binary.waveops_flags = shader.waveops_flags
 
