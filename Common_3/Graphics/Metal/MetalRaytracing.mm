@@ -46,6 +46,7 @@
 void add_texture(Renderer* pRenderer, const TextureDesc* pDesc, Texture** pTexture, const bool isRT);
 void util_end_current_encoders(Cmd* pCmd, bool forceBarrier);
 void util_barrier_required(Cmd* pCmd, const QueueType& encoderType);
+bool util_reserve_encoder_sample(Cmd* pCmd, bool renderStage, uint32_t* pOutStartIndex);
 
 extern "C"
 {
@@ -459,7 +460,24 @@ void cmdBuildAccelerationStructure(Cmd* pCmd, Raytracing* pRaytracing, Raytracin
     if (!pCmd->pASEncoder)
     {
         util_end_current_encoders(pCmd, true);
-        pCmd->pASEncoder = [pCmd->pCommandBuffer accelerationStructureCommandEncoder];
+
+        // Acceleration-structure work is a whole encoder's worth of GPU time like a compute pass is, and it
+        // takes the same two encoder-boundary counters -- so the BLAS/TLAS build shows up in the profiler
+        // instead of reading zero. No open query bracket leaves the descriptor bare, which is the plain
+        // encoder Metal would have given us.
+        MTLAccelerationStructurePassDescriptor* passDescriptor = [MTLAccelerationStructurePassDescriptor
+                                                                  accelerationStructurePassDescriptor];
+        uint32_t                                sampleStartIndex = 0;
+        if (util_reserve_encoder_sample(pCmd, false, &sampleStartIndex))
+        {
+            MTLAccelerationStructurePassSampleBufferAttachmentDescriptor* sampleAttachmentDesc =
+                passDescriptor.sampleBufferAttachments[0];
+            sampleAttachmentDesc.sampleBuffer = pCmd->pCurrentQueryPool->pSampleBuffer;
+            sampleAttachmentDesc.startOfEncoderSampleIndex = sampleStartIndex;
+            sampleAttachmentDesc.endOfEncoderSampleIndex = sampleStartIndex + 1;
+        }
+
+        pCmd->pASEncoder = [pCmd->pCommandBuffer accelerationStructureCommandEncoderWithDescriptor:passDescriptor];
     }
 
     AccelerationStructure* as = pDesc->pAccelerationStructure;

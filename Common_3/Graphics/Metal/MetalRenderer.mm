@@ -121,6 +121,9 @@ typedef struct QuerySampleDesc
 #define NUM_DRAW_BOUNDARY_COUNTERS          2
 
 bool gIssuedQueryIgnoredWarning = false;
+// Set once the profiler has been told that this device samples no GPU counters at all, so the per-pass
+// zeros it will report are understood as "unavailable" and not as "free".
+bool gIssuedNoCounterSamplingWarning = false;
 
 #if defined(__cplusplus) && defined(RENDERER_CPP_NAMESPACE)
 namespace RENDERER_CPP_NAMESPACE
@@ -303,6 +306,11 @@ id<MTLCounterSet>          util_get_counterset(id<MTLDevice> device);
 MTLCounterResultTimestamp* util_resolve_counter_sample_buffer(uint32_t startSample, uint32_t sampleCount,
                                                               id<MTLCounterSampleBuffer> pSampleBuffer);
 void                       util_update_gpu_to_cpu_timestamp_factor(Renderer* pRenderer);
+// Claims the next counter-sample slots for the timestamp query bracket currently open on pCmd, so an
+// encoder about to be created samples into them. renderStage picks the 4-counter vertex/fragment shape
+// over the 2-counter whole-encoder one. Returns false when no bracket is open, the device cannot sample
+// at stage boundaries, or the pool is out of slots -- the caller then creates an unsampled encoder.
+bool                       util_reserve_encoder_sample(Cmd* pCmd, bool renderStage, uint32_t* pOutStartIndex);
 // GPU frame time accessor for macOS and iOS
 #define GPU_FREQUENCY 1000000000.0 // nanoseconds
 
@@ -4206,25 +4214,15 @@ void cmdBindRenderTargets(Cmd* pCmd, const BindRenderTargetsDesc* pDesc)
         // Add a sampler buffer attachment
         if (IOS14_RUNTIME)
         {
-            if (pCmd->pRenderer->pGpu->mStageBoundarySamplingSupported && pCmd->pCurrentQueryPool != nil)
+            uint32_t sampleStartIndex = 0;
+            if (util_reserve_encoder_sample(pCmd, true, &sampleStartIndex))
             {
                 MTLRenderPassSampleBufferAttachmentDescriptor* sampleAttachmentDesc = renderPassDesc.sampleBufferAttachments[0];
-                QueryPool*                                     pQueryPool = pCmd->pCurrentQueryPool;
-                QuerySampleDesc* pSample = &((QuerySampleDesc*)pQueryPool->pQueries)[pCmd->mCurrentQueryIndex];
-
-                uint32_t sampleStartIndex = pSample->mRenderStartIndex + (pSample->mRenderSamples * NUM_RENDER_STAGE_BOUNDARY_COUNTERS);
-
-                if (sampleStartIndex < (pQueryPool->mCount * NUM_RENDER_STAGE_BOUNDARY_COUNTERS))
-                {
-                    sampleAttachmentDesc.sampleBuffer = pQueryPool->pSampleBuffer;
-                    sampleAttachmentDesc.startOfVertexSampleIndex = sampleStartIndex;
-                    sampleAttachmentDesc.endOfVertexSampleIndex = sampleStartIndex + 1;
-                    sampleAttachmentDesc.startOfFragmentSampleIndex = sampleStartIndex + 2;
-                    sampleAttachmentDesc.endOfFragmentSampleIndex = sampleStartIndex + 3;
-
-                    pSample->mRenderSamples++;
-                    pQueryPool->mRenderSamplesOffset += NUM_RENDER_STAGE_BOUNDARY_COUNTERS;
-                }
+                sampleAttachmentDesc.sampleBuffer = pCmd->pCurrentQueryPool->pSampleBuffer;
+                sampleAttachmentDesc.startOfVertexSampleIndex = sampleStartIndex;
+                sampleAttachmentDesc.endOfVertexSampleIndex = sampleStartIndex + 1;
+                sampleAttachmentDesc.startOfFragmentSampleIndex = sampleStartIndex + 2;
+                sampleAttachmentDesc.endOfFragmentSampleIndex = sampleStartIndex + 3;
             }
         }
 
@@ -4354,25 +4352,14 @@ void cmdBindPipeline(Cmd* pCmd, Pipeline* pPipeline)
                 if (IOS14_RUNTIME)
                 {
                     MTLComputePassDescriptor* computePassDescriptor = [MTLComputePassDescriptor computePassDescriptor];
-                    MTLComputePassSampleBufferAttachmentDescriptor* sampleAttachmentDesc = computePassDescriptor.sampleBufferAttachments[0];
-                    if (pCmd->pRenderer->pGpu->mStageBoundarySamplingSupported && pCmd->pCurrentQueryPool != nil)
+                    uint32_t                  sampleStartIndex = 0;
+                    if (util_reserve_encoder_sample(pCmd, false, &sampleStartIndex))
                     {
-                        QueryPool*       pQueryPool = pCmd->pCurrentQueryPool;
-                        QuerySampleDesc* pSample = &((QuerySampleDesc*)pQueryPool->pQueries)[pCmd->mCurrentQueryIndex];
-
-                        uint32_t sampleStartIndex =
-                            pSample->mComputeStartIndex + (pSample->mComputeSamples * NUM_COMPUTE_STAGE_BOUNDARY_COUNTERS);
-
-                        if (sampleStartIndex < (pQueryPool->mCount * NUM_RENDER_STAGE_BOUNDARY_COUNTERS) +
-                                                   (pQueryPool->mCount * NUM_COMPUTE_STAGE_BOUNDARY_COUNTERS))
-                        {
-                            sampleAttachmentDesc.sampleBuffer = pQueryPool->pSampleBuffer;
-                            sampleAttachmentDesc.startOfEncoderSampleIndex = sampleStartIndex;
-                            sampleAttachmentDesc.endOfEncoderSampleIndex = sampleStartIndex + 1;
-
-                            pSample->mComputeSamples++;
-                            pQueryPool->mComputeSamplesOffset += NUM_COMPUTE_STAGE_BOUNDARY_COUNTERS;
-                        }
+                        MTLComputePassSampleBufferAttachmentDescriptor* sampleAttachmentDesc =
+                            computePassDescriptor.sampleBufferAttachments[0];
+                        sampleAttachmentDesc.sampleBuffer = pCmd->pCurrentQueryPool->pSampleBuffer;
+                        sampleAttachmentDesc.startOfEncoderSampleIndex = sampleStartIndex;
+                        sampleAttachmentDesc.endOfEncoderSampleIndex = sampleStartIndex + 1;
                     }
 
                     util_end_current_encoders(pCmd, barrierRequired);
@@ -5320,6 +5307,54 @@ void cmdWriteMarker(Cmd* pCmd, const MarkerDesc* pDesc)
 
 void getTimestampFrequency(Queue* pQueue, double* pFrequency) { *pFrequency = GPU_FREQUENCY; }
 
+bool util_reserve_encoder_sample(Cmd* pCmd, bool renderStage, uint32_t* pOutStartIndex)
+{
+    if (!pCmd->pRenderer->pGpu->mStageBoundarySamplingSupported || pCmd->pCurrentQueryPool == nil)
+    {
+        return false;
+    }
+
+    // The frame scope reads its span off the command buffer, not off counters, and it is the open bracket
+    // for every encoder a frame with no per-pass queries creates -- so sampling for it would put a counter
+    // attachment on every encoder of every frame and buy nothing.
+    if (pCmd->mCurrentQueryIndex == 0)
+    {
+        return false;
+    }
+
+    QueryPool*       pQueryPool = pCmd->pCurrentQueryPool;
+    QuerySampleDesc* pSample = &((QuerySampleDesc*)pQueryPool->pQueries)[pCmd->mCurrentQueryIndex];
+
+    // Each query owns a contiguous run of slots starting where the previous query's run ended
+    // (mRenderStartIndex / mComputeStartIndex, captured in cmdBeginQuery). The render half of the
+    // buffer occupies [0, mCount * NUM_RENDER_STAGE_BOUNDARY_COUNTERS); the compute half follows it.
+    if (renderStage)
+    {
+        const uint32_t startIndex = pSample->mRenderStartIndex + (pSample->mRenderSamples * NUM_RENDER_STAGE_BOUNDARY_COUNTERS);
+        if (startIndex + NUM_RENDER_STAGE_BOUNDARY_COUNTERS > pQueryPool->mCount * NUM_RENDER_STAGE_BOUNDARY_COUNTERS)
+        {
+            return false;
+        }
+
+        pSample->mRenderSamples++;
+        pQueryPool->mRenderSamplesOffset += NUM_RENDER_STAGE_BOUNDARY_COUNTERS;
+        *pOutStartIndex = startIndex;
+        return true;
+    }
+
+    const uint32_t startIndex = pSample->mComputeStartIndex + (pSample->mComputeSamples * NUM_COMPUTE_STAGE_BOUNDARY_COUNTERS);
+    if (startIndex + NUM_COMPUTE_STAGE_BOUNDARY_COUNTERS >
+        (pQueryPool->mCount * NUM_RENDER_STAGE_BOUNDARY_COUNTERS) + (pQueryPool->mCount * NUM_COMPUTE_STAGE_BOUNDARY_COUNTERS))
+    {
+        return false;
+    }
+
+    pSample->mComputeSamples++;
+    pQueryPool->mComputeSamplesOffset += NUM_COMPUTE_STAGE_BOUNDARY_COUNTERS;
+    *pOutStartIndex = startIndex;
+    return true;
+}
+
 void initQueryPool(Renderer* pRenderer, const QueryPoolDesc* pDesc, QueryPool** ppQueryPool)
 {
     if (QUERY_TYPE_TIMESTAMP != pDesc->mType)
@@ -5382,6 +5417,7 @@ void initQueryPool(Renderer* pRenderer, const QueryPoolDesc* pDesc, QueryPool** 
 
 void exitQueryPool(Renderer* pRenderer, QueryPool* pQueryPool)
 {
+    pQueryPool->pFrameCommandBuffer = nil;
     pQueryPool->pSampleBuffer = nil;
     SAFE_FREE(pQueryPool->pQueries);
     SAFE_FREE(pQueryPool);
@@ -5399,10 +5435,28 @@ void cmdBeginQuery(Cmd* pCmd, QueryPool* pQueryPool, QueryDesc* pQuery)
             pQueryPool->mRenderSamplesOffset = 0;
             pQueryPool->mComputeSamplesOffset = pQueryPool->mCount * NUM_RENDER_STAGE_BOUNDARY_COUNTERS;
             util_update_gpu_to_cpu_timestamp_factor(pCmd->pRenderer);
+
+            // Query 0 is the frame scope, and no arrangement of encoder-boundary counters can measure a
+            // whole frame: encoders opened outside a bracket sample nowhere, and the frame scope stops
+            // being the open bracket the moment a nested one begins. The command buffer's own GPU span
+            // can -- it is what Metal's own frame HUD reports -- so keep the buffer and read its times in
+            // getQueryData, which the profiler only reaches several frames later, long after it completed.
+            pQueryPool->pFrameCommandBuffer = pCmd->pCommandBuffer;
         }
 
         if (pCmd->pRenderer->pGpu->mStageBoundarySamplingSupported)
         {
+            // Stage-boundary counters only fire when an encoder is created, so an encoder that outlives
+            // the bracket that opened it would charge this pass for the next one's work -- and every pass
+            // after the first in a run of compute passes would reuse that encoder and report nothing at
+            // all. Closing whatever is open here (and again in cmdEndQuery) makes the encoders created
+            // between the two calls exactly this pass's, so each pass is charged once and only for itself.
+            // No render pass is split mid-pass: a bracket opens before the pass binds its render target
+            // and closes after the pass is done, and cmdBindRenderTarget would have ended the encoder
+            // anyway. The extra boundaries are compute-encoder splits, and they only exist while the
+            // profiler is bracketing -- with no query open, nothing here runs.
+            util_end_current_encoders(pCmd, false);
+
             QuerySampleDesc* pSample = &((QuerySampleDesc*)pQueryPool->pQueries)[pQuery->mIndex];
             pSample->mRenderSamples = 0;
             pSample->mComputeSamples = 0;
@@ -5446,14 +5500,14 @@ void cmdEndQuery(Cmd* pCmd, QueryPool* pQueryPool, QueryDesc* pQuery)
         }
         else if (pCmd->pRenderer->pGpu->mStageBoundarySamplingSupported)
         {
-            QuerySampleDesc* pSample = &((QuerySampleDesc*)pQueryPool->pQueries)[pQuery->mIndex];
-            if (!gIssuedQueryIgnoredWarning && pSample->mRenderSamples == 0 && pSample->mComputeSamples == 0)
-            {
-                gIssuedQueryIgnoredWarning = true;
-                LOGF(eWARNING, "A stage boundary BeginQuery() is being ignored: Try moving it above cmdBindRenderTarget() or "
-                               "cmdBindPipeline(Compute). "
-                               "Warning only issued once.");
-            }
+            // Close this bracket's encoders inside it, so their end-of-stage counters land before the next
+            // bracket opens and nothing this pass started is billed to the pass that follows. Pairs with the
+            // same call in cmdBeginQuery -- see the reasoning there.
+            util_end_current_encoders(pCmd, false);
+
+            // A bracket with no samples used to mean it had been opened too late to catch the encoder. It no
+            // longer can: the bracket owns every encoder opened between its two ends. Zero samples now just
+            // means the pass recorded no GPU work, which is a true zero and not worth a warning.
         }
     }
 }
@@ -5469,6 +5523,19 @@ void getQueryData(Renderer* pRenderer, QueryPool* pQueryPool, uint32_t queryInde
     ASSERT(pOutData);
 
     uint64_t sumEncoderTimestamps = 0;
+
+    // Query 0 is the frame scope; its span is the GPU time of the command buffer cmdBeginQuery kept for it
+    // (encoder counters cannot see a whole frame -- see there). A buffer that has not completed reports no
+    // times yet, which comes out as a zero span rather than a guess.
+    if (queryIndex == 0)
+    {
+        const double gpuSeconds = pQueryPool->pFrameCommandBuffer != nil
+                                      ? pQueryPool->pFrameCommandBuffer.GPUEndTime - pQueryPool->pFrameCommandBuffer.GPUStartTime
+                                      : 0.0;
+        pOutData->mBeginTimestamp = 0;
+        pOutData->mEndTimestamp = gpuSeconds > 0.0 ? (uint64_t)(gpuSeconds * GPU_FREQUENCY) : 0;
+        return;
+    }
 
     if (pQueryPool->pSampleBuffer != nil)
     {
@@ -5560,6 +5627,19 @@ void getQueryData(Renderer* pRenderer, QueryPool* pQueryPool, uint32_t queryInde
                 pOutData->mBeginTimestamp = timestamps[0].timestamp * pRenderer->mGpuToCpuTimestampFactor;
                 pOutData->mEndTimestamp = timestamps[1].timestamp * pRenderer->mGpuToCpuTimestampFactor;
             }
+        }
+    }
+    else
+    {
+        // No sample buffer means the device exposes neither stage- nor draw-boundary counter sampling, so
+        // every per-pass span below the frame scope reads zero. Say so once rather than let a table of
+        // zeros read as a free renderer.
+        if (!gIssuedNoCounterSamplingWarning)
+        {
+            gIssuedNoCounterSamplingWarning = true;
+            LOGF(eWARNING, "This device samples no GPU counters (neither stage nor draw boundary): per-pass GPU times are "
+                           "unavailable and will read 0. The frame total is still measured from the command buffer. "
+                           "Warning only issued once.");
         }
     }
 }

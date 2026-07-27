@@ -776,6 +776,12 @@ typedef struct QueryPool
         // Offset from the start of their relative origin
         uint32_t                   mRenderSamplesOffset;  // Origin: 0.
         uint32_t                   mComputeSamplesOffset; // Origin: RenderSampleCount * mCount.
+        // The command buffer query 0 -- the frame scope -- was opened on. Counter samples only exist at
+        // encoder boundaries, so they can never account for a whole frame; the command buffer's own
+        // GPUStartTime/GPUEndTime can, and that is what the frame scope reports. Held here (a strong
+        // reference) so getQueryData can read those times when the profiler comes back for this pool,
+        // several frames after the buffer completed.
+        id<MTLCommandBuffer>       pFrameCommandBuffer;
         uint32_t                   mType;
     };
 #endif
