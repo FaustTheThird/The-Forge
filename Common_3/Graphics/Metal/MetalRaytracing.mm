@@ -316,6 +316,12 @@ void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructu
             geomDesc.vertexBuffer = pGeom->pVertexBuffer->pBuffer;
             geomDesc.vertexBufferOffset = pGeom->mVertexOffset;
             geomDesc.vertexStride = pGeom->mVertexStride;
+            // Opacity lives on the geometry in D3D12/Vulkan and on this descriptor in Metal, and it
+            // defaults to non-opaque here. Left unset, every triangle is an any-hit CANDIDATE:
+            // intersection_query::next() stops at the first one and commits nothing, so a shader that
+            // reads the committed hit without running a candidate loop sees a miss and the ray traces
+            // through the whole scene.
+            geomDesc.opaque = (pGeom->mFlags & ACCELERATION_STRUCTURE_GEOMETRY_FLAG_OPAQUE) ? YES : NO;
 #if defined(ENABLE_ACCELERATION_STRUCTURE_VERTEX_FORMAT)
             if (MTL_RAYTRACING_SUPPORTED)
             {
@@ -366,6 +372,10 @@ void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructu
             ASSERT(pInst->pBottomAS);
             instanceDescs[i].options = ToMTLASOptions(pInst->mFlags);
             instanceDescs[i].mask = pInst->mInstanceMask;
+            // The instance buffer is CPU-visible scratch and arrives with whatever was in that memory,
+            // so every field of the descriptor has to be written — a stale offset here would send hits
+            // to the wrong intersection function.
+            instanceDescs[i].intersectionFunctionTableOffset = pInst->mInstanceContributionToHitGroupIndex;
             instanceDescs[i].accelerationStructureIndex = (uint32_t)[primitiveASArray indexOfObject:pInst->pBottomAS->mAS];
             // Copy the first three rows of the instance transformation matrix. Metal
             // assumes that the bottom row is (0, 0, 0, 1), which allows the renderer to
