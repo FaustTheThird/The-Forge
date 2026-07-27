@@ -5307,6 +5307,71 @@ void cmdWriteMarker(Cmd* pCmd, const MarkerDesc* pDesc)
 
 void getTimestampFrequency(Queue* pQueue, double* pFrequency) { *pFrequency = GPU_FREQUENCY; }
 
+// The stretch of GPU time one encoder was busy for, in raw counter ticks. getQueryData gathers one per encoder
+// a query opened and unions them, so a pass reports the time the GPU was inside its work rather than the sum of
+// stages that overlap each other.
+struct EncoderWindow
+{
+    MTLTimestamp mStart;
+    MTLTimestamp mEnd;
+};
+
+// A pass with more encoders than this is far outside anything the render graph does; the overflow is added
+// straight to the running total instead of being unioned, which can only over-report, never lose time.
+#define MaxEncoderWindows 64
+
+void util_add_encoder_window(EncoderWindow* pWindows, uint32_t* pWindowCount, MTLTimestamp start, MTLTimestamp end,
+                             uint64_t* pOverflowTicks)
+{
+    if (end <= start)
+    {
+        return;
+    }
+
+    if (*pWindowCount >= MaxEncoderWindows)
+    {
+        *pOverflowTicks += end - start;
+        return;
+    }
+
+    pWindows[*pWindowCount].mStart = start;
+    pWindows[*pWindowCount].mEnd = end;
+    ++(*pWindowCount);
+}
+
+// Total length of the union of the windows, in counter ticks. Insertion sort by start, then sweep: the counts
+// here are a handful of encoders per pass, so the quadratic sort is cheaper than anything with an allocation.
+uint64_t util_union_encoder_windows(EncoderWindow* pWindows, uint32_t windowCount)
+{
+    for (uint32_t i = 1; i < windowCount; ++i)
+    {
+        const EncoderWindow window = pWindows[i];
+        uint32_t            j = i;
+        while (j > 0 && pWindows[j - 1].mStart > window.mStart)
+        {
+            pWindows[j] = pWindows[j - 1];
+            --j;
+        }
+        pWindows[j] = window;
+    }
+
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < windowCount;)
+    {
+        MTLTimestamp spanStart = pWindows[i].mStart;
+        MTLTimestamp spanEnd = pWindows[i].mEnd;
+        uint32_t     next = i + 1;
+        while (next < windowCount && pWindows[next].mStart <= spanEnd)
+        {
+            spanEnd = max(spanEnd, pWindows[next].mEnd);
+            ++next;
+        }
+        total += spanEnd - spanStart;
+        i = next;
+    }
+    return total;
+}
+
 bool util_reserve_encoder_sample(Cmd* pCmd, bool renderStage, uint32_t* pOutStartIndex)
 {
     if (!pCmd->pRenderer->pGpu->mStageBoundarySamplingSupported || pCmd->pCurrentQueryPool == nil)
@@ -5543,6 +5608,15 @@ void getQueryData(Renderer* pRenderer, QueryPool* pQueryPool, uint32_t queryInde
         MTLCounterResultTimestamp* timestamps;
         if (pRenderer->pGpu->mStageBoundarySamplingSupported)
         {
+            // Collect one occupancy window per encoder this query opened, then measure the union of them.
+            // Adding stage deltas up instead double-counts: a render encoder's vertex and fragment stages
+            // overlap almost completely on a tiler, and back-to-back encoders can overlap each other -- so a
+            // sum can exceed the wall time the pass actually held the GPU, and a table of such sums can
+            // exceed the frame. The union cannot: it is the time the GPU was inside one of this pass's
+            // encoders, so per-pass times always fit inside the frame they came from.
+            EncoderWindow windows[MaxEncoderWindows];
+            uint32_t      windowCount = 0;
+
             uint32_t numSamples = pSample->mRenderSamples;
             uint32_t startSampleIndex = pSample->mRenderStartIndex;
             uint32_t sampleCount = numSamples * NUM_RENDER_STAGE_BOUNDARY_COUNTERS;
@@ -5552,7 +5626,6 @@ void getQueryData(Renderer* pRenderer, QueryPool* pQueryPool, uint32_t queryInde
 
             if (timestamps != nil)
             {
-                uint64_t maxVertTime = 0, minFragTime = UINT64_MAX;
                 // Check for invalid values within the (resolved) data from the counter sample buffer.
                 for (int index = 0; index < numSamples; ++index)
                 {
@@ -5573,15 +5646,10 @@ void getQueryData(Renderer* pRenderer, QueryPool* pQueryPool, uint32_t queryInde
                         continue;
                     }
 
-                    sumEncoderTimestamps += (eFragTime - sFragTime) + (eVertTime - sVertTime);
-
-                    maxVertTime = max(maxVertTime, eVertTime);
-                    minFragTime = min(minFragTime, sFragTime);
+                    // The encoder was busy from whichever stage started first to whichever finished last.
+                    util_add_encoder_window(windows, &windowCount, min(sVertTime, sFragTime), max(eVertTime, eFragTime),
+                                            &sumEncoderTimestamps);
                 }
-
-                // Subtract overlap delta..
-                if (minFragTime != UINT64_MAX)
-                    sumEncoderTimestamps -= (maxVertTime > minFragTime) ? maxVertTime - minFragTime : 0;
             }
 
             numSamples = pSample->mComputeSamples;
@@ -5597,7 +5665,7 @@ void getQueryData(Renderer* pRenderer, QueryPool* pQueryPool, uint32_t queryInde
                 {
                     uint32_t currentSampleIdx = index * NUM_COMPUTE_STAGE_BOUNDARY_COUNTERS;
 
-                    // Start and end of vertex stage.
+                    // Start and end of the encoder.
                     MTLTimestamp startTimestamp = timestamps[currentSampleIdx].timestamp;
                     MTLTimestamp endTimestamp = timestamps[currentSampleIdx + 1].timestamp;
 
@@ -5607,9 +5675,11 @@ void getQueryData(Renderer* pRenderer, QueryPool* pQueryPool, uint32_t queryInde
                         continue;
                     }
 
-                    sumEncoderTimestamps += endTimestamp - startTimestamp;
+                    util_add_encoder_window(windows, &windowCount, startTimestamp, endTimestamp, &sumEncoderTimestamps);
                 }
             }
+
+            sumEncoderTimestamps += util_union_encoder_windows(windows, windowCount);
             pOutData->mBeginTimestamp = 0;
             pOutData->mEndTimestamp = sumEncoderTimestamps * pRenderer->mGpuToCpuTimestampFactor;
         }
