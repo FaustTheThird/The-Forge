@@ -5535,7 +5535,14 @@ void cmdBeginQuery(Cmd* pCmd, QueryPool* pQueryPool, QueryDesc* pQuery)
             // and closes after the pass is done, and cmdBindRenderTarget would have ended the encoder
             // anyway. The extra boundaries are compute-encoder splits, and they only exist while the
             // profiler is bracketing -- with no query open, nothing here runs.
-            util_end_current_encoders(pCmd, false);
+            //
+            // The close is forced to fence. A queued cmdResourceBarrier only raises flags on the queue;
+            // those flags become a cross-encoder updateFence exclusively inside util_end_current_encoders,
+            // so an encoder closed here with no flags pending is published unfenced and the consumer's
+            // later barrier degrades to an intra-encoder memoryBarrierWithScope that orders nothing across
+            // the boundary. An encoder split nobody asked for must therefore never order more weakly than
+            // not splitting at all, which is what forcing the fence guarantees.
+            util_end_current_encoders(pCmd, true);
 
             QuerySampleDesc* pSample = &((QuerySampleDesc*)pQueryPool->pQueries)[pQuery->mIndex];
             pSample->mRenderSamples = 0;
@@ -5581,9 +5588,9 @@ void cmdEndQuery(Cmd* pCmd, QueryPool* pQueryPool, QueryDesc* pQuery)
         else if (pCmd->pRenderer->pGpu->mStageBoundarySamplingSupported)
         {
             // Close this bracket's encoders inside it, so their end-of-stage counters land before the next
-            // bracket opens and nothing this pass started is billed to the pass that follows. Pairs with the
-            // same call in cmdBeginQuery -- see the reasoning there.
-            util_end_current_encoders(pCmd, false);
+            // bracket opens and nothing this pass started is billed to the pass that follows. Forced to
+            // fence for the same reason as the paired call in cmdBeginQuery -- see the reasoning there.
+            util_end_current_encoders(pCmd, true);
 
             // A bracket with no samples used to mean it had been opened too late to catch the encoder. It no
             // longer can: the bracket owns every encoder opened between its two ends. Zero samples now just
