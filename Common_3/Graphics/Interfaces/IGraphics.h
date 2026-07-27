@@ -2976,6 +2976,14 @@ void updateDescriptorSet(Renderer* pRenderer, uint32_t index, DescriptorSet* pDe
 void resetCmdPool(Renderer* pRenderer, CmdPool* pCmdPool);
 void beginCmd(Cmd* pCmd);
 void endCmd(Cmd* pCmd);
+#if defined(METAL)
+// Hand the command buffer over to a framework that encodes into it directly (MetalFX and friends encode to
+// the MTLCommandBuffer, not into an encoder we hold). Ends whatever encoder is open and leaves the queue's
+// fence raised, so the encoder that follows waits on it; the return value is that id<MTLFence>, which the
+// framework must be told to wait on and signal. Nothing in Metal orders work across an encoder boundary by
+// itself, so skipping either half of the handshake lets the framework and the renderer run concurrently.
+void* mtlCmdSuspendEncoding(Cmd* pCmd);
+#endif
 void cmdBindRenderTargets(Cmd* pCmd, const BindRenderTargetsDesc* pDesc);
 void cmdSetViewport(Cmd* pCmd, float x, float y, float width, float height, float minDepth, float maxDepth);
 void cmdSetScissor(Cmd* pCmd, uint32_t x, uint32_t y, uint32_t width, uint32_t height);

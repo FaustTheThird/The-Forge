@@ -4028,6 +4028,21 @@ void endCmd(Cmd* pCmd)
     }
 }
 
+void* mtlCmdSuspendEncoding(Cmd* pCmd)
+{
+    ASSERT(pCmd);
+    @autoreleasepool
+    {
+        // forceBarrier: the caller is about to encode work this renderer knows nothing about, so the gap has
+        // to be fenced whether or not a resource barrier happens to be pending.
+        util_end_current_encoders(pCmd, true);
+    }
+    // util_end_current_encoders only raises the flag when it actually closed something; raise it here too so
+    // a suspend with nothing open still makes the next encoder wait for what the framework signals.
+    pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_FENCE;
+    return (__bridge void*)pCmd->pQueue->pQueueFence;
+}
+
 void cmdBindRenderTargets(Cmd* pCmd, const BindRenderTargetsDesc* pDesc)
 {
     ASSERT(pCmd);
