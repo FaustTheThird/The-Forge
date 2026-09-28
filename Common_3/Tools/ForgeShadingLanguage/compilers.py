@@ -200,6 +200,8 @@ def compile_binary(platform: Platforms, debug: bool, binary: ShaderBinary, src, 
             params += ['/T', util_shadertarget_dx(binary.stage, binary.features)]
             params += ['/I', fsl_basepath, '/Fo', compiled_filepath, src]
             params += ['-flegacy-macro-expansion']
+            if Features.STRICT_FP in binary.features:
+                params += ['-Gis']
             
             if binary.stage is Stages.ROOTSIG:
                 if 'compute.rootsig' in compiled_filepath:
@@ -296,6 +298,8 @@ def compile_binary(platform: Platforms, debug: bool, binary: ShaderBinary, src, 
 
             if Features.INVARIANT in binary.features:
                 params += ['-fpreserve-invariance']
+            if Features.STRICT_FP in binary.features:
+                params += ['-fno-fast-math']
 
             params += [f"-std={util_shadertarget_metal(platform, binary)}"]
             params += ['-Wno-unused-variable']
@@ -321,6 +325,8 @@ def compile_binary(platform: Platforms, debug: bool, binary: ShaderBinary, src, 
 
             if Features.INVARIANT in binary.features:
                 params += ['-fpreserve-invariance']
+            if Features.STRICT_FP in binary.features:
+                params += ['-fno-fast-math']
 
             params += [f"-std={util_shadertarget_metal(platform, binary)}"]
             params += ['-Wno-unused-variable']
