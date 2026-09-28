@@ -299,7 +299,8 @@ def compile_binary(platform: Platforms, debug: bool, binary: ShaderBinary, src, 
             if Features.INVARIANT in binary.features:
                 params += ['-fpreserve-invariance']
             if Features.STRICT_FP in binary.features:
-                params += ['-fno-fast-math']
+                # -fno-fast-math leaves clang's default -ffp-contract=on, which still fuses a*b+c into an fma.
+                params += ['-fno-fast-math', '-ffp-contract=off']
 
             params += [f"-std={util_shadertarget_metal(platform, binary)}"]
             params += ['-Wno-unused-variable']
@@ -326,7 +327,8 @@ def compile_binary(platform: Platforms, debug: bool, binary: ShaderBinary, src, 
             if Features.INVARIANT in binary.features:
                 params += ['-fpreserve-invariance']
             if Features.STRICT_FP in binary.features:
-                params += ['-fno-fast-math']
+                # -fno-fast-math leaves clang's default -ffp-contract=on, which still fuses a*b+c into an fma.
+                params += ['-fno-fast-math', '-ffp-contract=off']
 
             params += [f"-std={util_shadertarget_metal(platform, binary)}"]
             params += ['-Wno-unused-variable']

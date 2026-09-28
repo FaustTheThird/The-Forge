@@ -94,7 +94,9 @@ class Features(Enum):
     DYNAMIC_RESOURCES = 10,
     # IEEE-strict floating point for the whole binary: no contraction, reassociation or other fast-math rewrite, so
     # a value is the same function of its inputs however the driver recompiles the pipeline. DIRECT3D12 compiles
-    # with dxc -Gis, Metal with -fno-fast-math; glslang has no equivalent switch (Vulkan keeps per-value precise).
+    # with dxc -Gis, Metal with -fno-fast-math -ffp-contract=off; glslang has no equivalent switch (Vulkan keeps
+    # per-value precise), and the Xbox dxc path takes its switches from the platform's xbox module, which does not
+    # read this feature.
     STRICT_FP = 11,
 
 feature_mask = { f: [] for f in Features }
