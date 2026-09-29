@@ -508,10 +508,60 @@ static DxDescriptorID consume_descriptor_handles(DescriptorHeap* pHeap, uint32_t
             }
         }
     }
+    // Never hand out the partial tail. The old release path returned it as a complete range,
+    // then CopyDescriptorsSimple wrote past the heap into the driver.
+    return_descriptor_handles_unlocked(pHeap, firstResult, foundCount);
+    LOGF(eERROR, "D3D12 descriptor heap exhausted: requested %u, used %u of %u", descriptorCount, pHeap->mUsedDescriptors, pHeap->mNumDescriptors);
     releaseMutex(&pHeap->mMutex);
+    abort();
 
-    ASSERT(result != D3D12_DESCRIPTOR_ID_NONE && "Out of descriptors");
-    return firstResult;
+}
+
+// Bloom tool previews preflight their complete SRT budget on the renderer thread. Requiring one
+// contiguous free span is conservative when fragmented, and guarantees every subsequent set fits.
+bool bloomD3D12CanAllocateDescriptors(Renderer* renderer, uint32_t count)
+{
+    for (uint32_t node = 0; node < renderer->mLinkedNodeCount; ++node)
+    {
+        DescriptorHeap* heap = renderer->mDx.pCbvSrvUavHeaps[node];
+        uint32_t run = 0;
+        acquireMutex(&heap->mMutex);
+        for (uint32_t i = 0; i < heap->mNumDescriptors && run < count; ++i)
+            run = (heap->pFlags[i / 32] & (1u << (i % 32))) ? 0 : run + 1;
+        releaseMutex(&heap->mMutex);
+        if (run < count) return false;
+    }
+    return true;
+}
+
+// Simulate the same first-fit allocations as addDescriptorSet, in creation order.
+// A graph uses separate descriptor ranges; it does not need one contiguous sum.
+bool bloomD3D12CanAllocateDescriptorSets(Renderer* renderer, const uint32_t* counts, uint32_t count)
+{
+    for (uint32_t node = 0; node < renderer->mLinkedNodeCount; ++node)
+    {
+        DescriptorHeap* heap = renderer->mDx.pCbvSrvUavHeaps[node];
+        const size_t bytes = (heap->mNumDescriptors / 32) * sizeof(uint32_t);
+        uint32_t* flags = (uint32_t*)tf_malloc(bytes);
+        if (!flags) return false;
+        acquireMutex(&heap->mMutex);
+        memcpy(flags, heap->pFlags, bytes);
+        releaseMutex(&heap->mMutex);
+        bool fits = true;
+        for (uint32_t set = 0; set < count && fits; ++set)
+        {
+            const uint32_t required = counts[set];
+            if (!required) continue;
+            uint32_t run = 0, end = 0;
+            for (; end < heap->mNumDescriptors && run < required; ++end)
+                run = (flags[end / 32] & (1u << (end % 32))) ? 0 : run + 1;
+            if (run < required) { fits = false; break; }
+            for (uint32_t i = end - required; i < end; ++i) flags[i / 32] |= 1u << (i % 32);
+        }
+        tf_free(flags);
+        if (!fits) return false;
+    }
+    return true;
 }
 
 static inline FORGE_CONSTEXPR D3D12_CPU_DESCRIPTOR_HANDLE descriptor_id_to_cpu_handle(DescriptorHeap* pHeap, DxDescriptorID id)
