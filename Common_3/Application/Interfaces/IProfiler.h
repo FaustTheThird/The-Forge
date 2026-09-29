@@ -105,7 +105,7 @@ FORGE_API void exitGpuProfiler(ProfileToken nProfileToken);
 
 // Must be called before any call to cmdBeginGpuTimestampQuery
 // Preferred time to call this function is right after calling beginCmd
-FORGE_API void cmdBeginGpuFrameProfile(Cmd* pCmd, ProfileToken nProfileToken, bool bUseMarker = true);
+FORGE_API void cmdBeginGpuFrameProfile(Cmd* pCmd, ProfileToken nProfileToken, bool bUseMarker = true, uint64_t frameLabel = UINT64_MAX);
 
 // Must be called after all gpu profiles are finished.
 // This function cannot be called inside a render pass (cmdBeginRender-cmdEndRender)
@@ -118,6 +118,10 @@ FORGE_API void cmdEndGpuTimestampQuery(Cmd* pCmd, ProfileToken nProfileToken);
 
 // Gpu times in milliseconds
 FORGE_API float getGpuProfileTime(ProfileToken nProfileToken);
+// Latest resolved submission label; UINT64_MAX until a valid root timestamp resolves.
+FORGE_API uint64_t getGpuProfileFrameIndex(ProfileToken nProfileToken);
+// Parent scopes exclude their direct children, all from the same resolved submission.
+FORGE_API float getGpuProfileExclusiveTime(ProfileToken nProfileToken);
 FORGE_API float getGpuProfileAvgTime(ProfileToken nProfileToken);
 FORGE_API float getGpuProfileMinTime(ProfileToken nProfileToken);
 FORGE_API float getGpuProfileMaxTime(ProfileToken nProfileToken);

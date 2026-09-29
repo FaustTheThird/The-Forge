@@ -23,6 +23,7 @@
  */
 
 #pragma once
+#include "GpuQueryHistory.h"
 #include "../../Utilities/Math/MathTypes.h"
 
 struct Cmd;
@@ -39,6 +40,9 @@ typedef struct GpuTimer
 
     char     mName[64] = "Timer";
     uint32_t mIndex = 0;
+    GpuQueryHistory mQueries;
+    uint64_t mResolvedSerial = 0;
+    bool mResolvedValid = false;
     uint32_t mHistoryIndex = 0;
     uint32_t mDepth = 0;
 
@@ -60,13 +64,19 @@ typedef struct GpuTimer
 typedef struct GpuProfiler
 {
     // double buffered
-    static const uint32_t NUM_OF_FRAMES = 3;
+    static const uint32_t NUM_OF_FRAMES = GpuQueryHistory::FrameCount;
     static const uint32_t MAX_TIMERS = 512;
 
     Renderer*  pRenderer = {};
     QueryPool* pQueryPool[NUM_OF_FRAMES] = {};
     uint32_t   mCurrentTimerCount[NUM_OF_FRAMES] = {};
     double     mGpuTimeStampFrequency = 0.0;
+
+    uint64_t mNextSerial = 0;
+    uint64_t mFrameSerial[NUM_OF_FRAMES] = {};
+    uint64_t mFrameLabel[NUM_OF_FRAMES] = {};
+    uint64_t mResolvedSerial = 0;
+    uint64_t mResolvedFrame = UINT64_MAX;
 
     uint32_t mProfilerIndex = 0;
     uint32_t mBufferIndex = 0;
