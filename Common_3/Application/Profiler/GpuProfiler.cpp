@@ -79,7 +79,11 @@ GpuProfiler* getGpuProfiler(ProfileToken nProfileToken)
     return gGpuProfilerContainer->mProfilers[getProfileIndex(nProfileToken)];
 }
 
-static void calculateTimes(Cmd* pCmd, GpuProfiler* pGpuProfiler, uint32_t index)
+// emitMicroProfile is false for a scope resolved after the tree walk (and its children): MicroProfile's GPU log is
+// a nesting of enter/leave pairs in time order, and by then the root's leave has already been written, so an enter
+// emitted for that scope would open after its enclosing frame closed and corrupt the log's nesting. Its timings are
+// still resolved and recorded in the timer history; only the MicroProfile emission is skipped.
+static void calculateTimes(Cmd* pCmd, GpuProfiler* pGpuProfiler, uint32_t index, bool emitMicroProfile)
 {
     GpuTimer* pRoot = &pGpuProfiler->pGpuTimerPool[index];
     uint32_t id = 0;
@@ -112,7 +116,7 @@ static void calculateTimes(Cmd* pCmd, GpuProfiler* pGpuProfiler, uint32_t index)
     {
         MutexLock lock(ProfileGetMutex());
         Profile*  S = ProfileGet();
-        if (pRoot->mResolvedValid && S->nRunning && pRoot->mMicroProfileToken != PROFILE_INVALID_TOKEN)
+        if (emitMicroProfile && pRoot->mResolvedValid && S->nRunning && pRoot->mMicroProfileToken != PROFILE_INVALID_TOKEN)
         {
             ProfileEnterGpu(pRoot->mMicroProfileToken, pRoot->mStartGpuTime, pGpuProfiler->pLog);
 
@@ -130,14 +134,14 @@ static void calculateTimes(Cmd* pCmd, GpuProfiler* pGpuProfiler, uint32_t index)
     {
         if (pGpuProfiler->pGpuTimerPool[i].pParent == pRoot)
         {
-            calculateTimes(pCmd, pGpuProfiler, i);
+            calculateTimes(pCmd, pGpuProfiler, i, emitMicroProfile);
         }
     }
     pRoot->mStarted = false; // Reset
     {
         MutexLock lock(ProfileGetMutex());
         Profile*  S = ProfileGet();
-        if (pRoot->mResolvedValid && S->nRunning && pRoot->mMicroProfileToken != PROFILE_INVALID_TOKEN)
+        if (emitMicroProfile && pRoot->mResolvedValid && S->nRunning && pRoot->mMicroProfileToken != PROFILE_INVALID_TOKEN)
         {
             ProfileLeaveGpu(pRoot->mMicroProfileToken, pRoot->mEndGpuTime, pGpuProfiler->pLog);
         } //-V1020
@@ -374,16 +378,17 @@ void cmdBeginGpuFrameProfile(Cmd* pCmd, ProfileToken nProfileToken, bool bUseMar
 
     pGpuProfiler->mResolvedSerial = pGpuProfiler->mFrameSerial[nextIndex];
     pGpuProfiler->mResolvedFrame = pGpuProfiler->mFrameLabel[nextIndex];
-    calculateTimes(pCmd, pGpuProfiler, 0);
+    calculateTimes(pCmd, pGpuProfiler, 0, true);
     // The walk above reaches a scope only through the parent pointer it has now and only at a pool index above
     // that parent's, so a scope recorded in this slot under a parent it no longer has, or created in the pool before
     // its parent, is not reached. Left pending, its query would never be read and its next begin in this slot would
-    // overwrite it. Resolve every scope still pending here, each once (Consume clears the slot).
+    // overwrite it. Resolve every scope still pending here, each once (Consume clears the slot), without MicroProfile
+    // events: the root's leave is already in MicroProfile's log, so these would be out of nesting order.
     for (uint32_t i = 1; i < pGpuProfiler->mCurrentPoolIndex; ++i)
     {
         if (pGpuProfiler->pGpuTimerPool[i].mQueries.Pending[nextIndex])
         {
-            calculateTimes(pCmd, pGpuProfiler, i);
+            calculateTimes(pCmd, pGpuProfiler, i, false);
         }
     }
     ASSERT(!GpuAnyQueryPending(pGpuProfiler->pGpuTimerPool, pGpuProfiler->mCurrentPoolIndex, nextIndex) &&
