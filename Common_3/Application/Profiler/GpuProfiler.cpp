@@ -375,6 +375,19 @@ void cmdBeginGpuFrameProfile(Cmd* pCmd, ProfileToken nProfileToken, bool bUseMar
     pGpuProfiler->mResolvedSerial = pGpuProfiler->mFrameSerial[nextIndex];
     pGpuProfiler->mResolvedFrame = pGpuProfiler->mFrameLabel[nextIndex];
     calculateTimes(pCmd, pGpuProfiler, 0);
+    // The walk above reaches a scope only through the parent pointer it has now and only at a pool index above
+    // that parent's, so a scope recorded in this slot under a parent it no longer has, or created in the pool before
+    // its parent, is not reached. Left pending, its query would never be read and its next begin in this slot would
+    // overwrite it. Resolve every scope still pending here, each once (Consume clears the slot).
+    for (uint32_t i = 1; i < pGpuProfiler->mCurrentPoolIndex; ++i)
+    {
+        if (pGpuProfiler->pGpuTimerPool[i].mQueries.Pending[nextIndex])
+        {
+            calculateTimes(pCmd, pGpuProfiler, i);
+        }
+    }
+    ASSERT(!GpuAnyQueryPending(pGpuProfiler->pGpuTimerPool, pGpuProfiler->mCurrentPoolIndex, nextIndex) &&
+           "a GPU scope's query was left unresolved");
 
     if (pGpuProfiler->mCurrentTimerCount[pGpuProfiler->mBufferIndex])
     {

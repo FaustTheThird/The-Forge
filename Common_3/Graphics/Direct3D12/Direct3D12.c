@@ -59,6 +59,7 @@
 #endif
 
 #include <math.h> // pow, etc...
+#include <stdio.h> // snprintf, fflush
 
 #include "../../Utilities/Interfaces/IMemory.h"
 
@@ -378,6 +379,12 @@ typedef struct DescriptorIndexMap
 // in the occupancy masks are toggled off.
 #define DESCRIPTOR_HEAP_BLOCK_SIZE 32
 
+// Called with the message when a descriptor heap runs out, before the process aborts (see
+// consume_descriptor_handles), so a host can surface it through its own log or UI.
+typedef void (*BloomD3D12FatalHandler)(const char* message);
+static BloomD3D12FatalHandler gBloomD3D12FatalHandler = NULL;
+void bloomD3D12SetFatalHandler(BloomD3D12FatalHandler handler);
+
 static void add_descriptor_heap(ID3D12Device* pDevice, const D3D12_DESCRIPTOR_HEAP_DESC* pDesc, DescriptorHeap** ppDescHeap)
 {
     uint32_t numDescriptors = pDesc->NumDescriptors;
@@ -509,39 +516,45 @@ static DxDescriptorID consume_descriptor_handles(DescriptorHeap* pHeap, uint32_t
         }
     }
     // Never hand out the partial tail. The old release path returned it as a complete range,
-    // then CopyDescriptorsSimple wrote past the heap into the driver.
+    // then CopyDescriptorsSimple wrote past the heap into the driver. None of the callers
+    // (resource views, render targets, descriptor sets) has a failure path to take instead,
+    // so this stays fatal: the message reaches the log and the host's fatal handler, and every
+    // stdio buffer is flushed, before the process ends. A host that must not reach it checks
+    // first (bloomD3D12CanAllocateDescriptorSets).
     return_descriptor_handles_unlocked(pHeap, firstResult, foundCount);
-    LOGF(eERROR, "D3D12 descriptor heap exhausted: requested %u, used %u of %u", descriptorCount, pHeap->mUsedDescriptors, pHeap->mNumDescriptors);
+    char message[256];
+    snprintf(message, sizeof message, "D3D12 descriptor heap exhausted: requested %u, used %u of %u", descriptorCount,
+             pHeap->mUsedDescriptors, pHeap->mNumDescriptors);
     releaseMutex(&pHeap->mMutex);
-    abort();
-
-}
-
-// Bloom tool previews preflight their complete SRT budget on the renderer thread. Requiring one
-// contiguous free span is conservative when fragmented, and guarantees every subsequent set fits.
-bool bloomD3D12CanAllocateDescriptors(Renderer* renderer, uint32_t count)
-{
-    for (uint32_t node = 0; node < renderer->mLinkedNodeCount; ++node)
+    LOGF(eERROR, "%s", message);
+    fflush(NULL);
+    if (gBloomD3D12FatalHandler)
     {
-        DescriptorHeap* heap = renderer->mDx.pCbvSrvUavHeaps[node];
-        uint32_t run = 0;
-        acquireMutex(&heap->mMutex);
-        for (uint32_t i = 0; i < heap->mNumDescriptors && run < count; ++i)
-            run = (heap->pFlags[i / 32] & (1u << (i % 32))) ? 0 : run + 1;
-        releaseMutex(&heap->mMutex);
-        if (run < count) return false;
+        gBloomD3D12FatalHandler(message);
     }
-    return true;
+    fflush(NULL);
+    abort();
 }
+
+void bloomD3D12SetFatalHandler(BloomD3D12FatalHandler handler) { gBloomD3D12FatalHandler = handler; }
 
 // Simulate the same first-fit allocations as addDescriptorSet, in creation order.
 // A graph uses separate descriptor ranges; it does not need one contiguous sum.
+// Only the CBV/SRV/UAV heap is simulated: the sets a host checks this way must declare no
+// samplers (Bloom's surface-graph SRTs declare none; their samplers are static), so they
+// take nothing from the sampler heap.
 bool bloomD3D12CanAllocateDescriptorSets(Renderer* renderer, const uint32_t* counts, uint32_t count)
 {
     for (uint32_t node = 0; node < renderer->mLinkedNodeCount; ++node)
     {
         DescriptorHeap* heap = renderer->mDx.pCbvSrvUavHeaps[node];
-        const size_t bytes = (heap->mNumDescriptors / 32) * sizeof(uint32_t);
+        // Scan exactly the whole 32-descriptor blocks pFlags holds, the bound
+        // consume_descriptor_handles scans. add_descriptor_heap rounds the heap up to whole
+        // blocks today; deriving the copy and the scan from the same block count keeps the
+        // copy in bounds even if a heap ever is not.
+        const uint32_t blocks = heap->mNumDescriptors / DESCRIPTOR_HEAP_BLOCK_SIZE;
+        const uint32_t usable = blocks * DESCRIPTOR_HEAP_BLOCK_SIZE;
+        const size_t bytes = blocks * sizeof(uint32_t);
         uint32_t* flags = (uint32_t*)tf_malloc(bytes);
         if (!flags) return false;
         acquireMutex(&heap->mMutex);
@@ -553,7 +566,7 @@ bool bloomD3D12CanAllocateDescriptorSets(Renderer* renderer, const uint32_t* cou
             const uint32_t required = counts[set];
             if (!required) continue;
             uint32_t run = 0, end = 0;
-            for (; end < heap->mNumDescriptors && run < required; ++end)
+            for (; end < usable && run < required; ++end)
                 run = (flags[end / 32] & (1u << (end % 32))) ? 0 : run + 1;
             if (run < required) { fits = false; break; }
             for (uint32_t i = end - required; i < end; ++i) flags[i / 32] |= 1u << (i % 32);

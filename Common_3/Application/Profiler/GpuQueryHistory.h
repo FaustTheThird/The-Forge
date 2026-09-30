@@ -17,6 +17,16 @@ struct GpuQueryHistory
         return true;
     }
 };
+// Whether any of `count` timers still has a query pending in `slot`; after a slot is resolved, none may.
+template <typename Timer>
+inline bool GpuAnyQueryPending(const Timer* timers, uint32_t count, uint32_t slot)
+{
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        if (timers[i].mQueries.Pending[slot]) return true;
+    }
+    return false;
+}
 inline bool GpuQueryElapsed(uint64_t begin, uint64_t end, uint64_t& ticks)
 {
     ticks = 0;
