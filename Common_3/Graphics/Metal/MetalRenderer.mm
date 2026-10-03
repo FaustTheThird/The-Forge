@@ -1056,8 +1056,8 @@ void addDescriptorSet(Renderer* pRenderer, const DescriptorSetDesc* pDesc, Descr
                             {
                                 Buffer* buffer = pDefaultBuffer;
                                 [pDescriptorSet->mArgumentEncoder setBuffer:buffer->pBuffer
-                                                                     offset:j
-                                                                    atIndex:argumentMemberIndex + arrayStart];
+                                                                     offset:0
+                                                                    atIndex:argumentMemberIndex + arrayStart + j];
                             }
                         }
                     }
@@ -1074,7 +1074,7 @@ void addDescriptorSet(Renderer* pRenderer, const DescriptorSetDesc* pDesc, Descr
             }
             if (useArgumentBuffer)
             {
-                argumentMemberIndex++;
+                argumentMemberIndex += desc->mCount;
             }
         }
     }
