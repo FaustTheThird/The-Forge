@@ -65,6 +65,11 @@ enum
 #endif
 #if defined(METAL)
     MAX_DESCRIPTOR_SETS = 8,
+    // Encoder-transition fences per queue (see Queue::pQueueFences). Needs to exceed the number of
+    // encoder switches a single frame performs, so a pending wait is never overwritten by a later
+    // producer before its consumer runs; the index wraps, so an undersized ring degrades to the old
+    // shared-fence behaviour rather than breaking.
+    MTL_QUEUE_FENCE_COUNT = 64,
 #endif
 };
 #endif
@@ -1760,7 +1765,14 @@ typedef struct Queue
     struct
     {
         id<MTLCommandQueue> pCommandQueue;
-        id<MTLFence>        pQueueFence;
+        // Ring of fences for encoder-to-encoder ordering. A single shared MTLFence only orders a strictly
+        // alternating update/wait chain: if two encoders update it before a consumer waits, the consumer
+        // is ordered against the LATER update and the earlier producer is not ordered at all. A GPU-driven
+        // frame (compute cull -> mesh raster -> compute HZB -> compute cull -> mesh raster) does exactly
+        // that, and the raster intermittently consumed the pre-cull contents of its inputs. Handing each
+        // encoder transition its own fence keeps every producer/consumer pair independently ordered.
+        id<MTLFence>        pQueueFences[MTL_QUEUE_FENCE_COUNT];
+        uint32_t            mFenceIndex;
         uint32_t            mBarrierFlags;
     };
 #endif

@@ -2754,7 +2754,11 @@ void initQueue(Renderer* pRenderer, QueueDesc* pDesc, Queue** ppQueue)
     [pQueue->pCommandQueue setLabel:[NSString stringWithUTF8String:(pDesc->pName ? pDesc->pName : queueNames[pDesc->mType])]];
 
     pQueue->mBarrierFlags = 0;
-    pQueue->pQueueFence = [pRenderer->pDevice newFence];
+    pQueue->mFenceIndex = 0;
+    for (uint32_t i = 0; i < MTL_QUEUE_FENCE_COUNT; ++i)
+    {
+        pQueue->pQueueFences[i] = [pRenderer->pDevice newFence];
+    }
     ASSERT(pQueue->pCommandQueue != nil);
 
     *ppQueue = pQueue;
@@ -2765,7 +2769,10 @@ void exitQueue(Renderer* pRenderer, Queue* pQueue)
     ASSERT(pQueue);
 
     pQueue->pCommandQueue = nil;
-    pQueue->pQueueFence = nil;
+    for (uint32_t i = 0; i < MTL_QUEUE_FENCE_COUNT; ++i)
+    {
+        pQueue->pQueueFences[i] = nil;
+    }
 
     SAFE_FREE(pQueue);
 }
@@ -4226,7 +4233,14 @@ void cmdBindRenderTargets(Cmd* pCmd, const BindRenderTargetsDesc* pDesc)
             }
         }
 
-        util_end_current_encoders(pCmd, false);
+        // forceBarrier = true: always fence the outgoing encoder when a render pass begins. It used to be
+        // conditional on mBarrierFlags still being raised at this exact point, which a preceding dispatch
+        // can clear (cmdDispatch consumes them via util_barrier_required). A GPU-driven frame that ends a
+        // COMPUTE pass and immediately starts a render pass reading what that compute wrote — the cull ->
+        // mega-raster handover — then got no fence at all, and the raster consumed the pre-cull contents of
+        // the indirect args and survivor list. Symptom: whole frames intermittently render no geometry.
+        // Cost is one fence per render-pass begin, which is negligible against a mis-ordered frame.
+        util_end_current_encoders(pCmd, true);
         pCmd->pRenderEncoder = [pCmd->pCommandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
 
 #if defined(ENABLE_GRAPHICS_DEBUG_ANNOTATION)
@@ -5791,7 +5805,29 @@ void util_bind_root_buffer(Cmd* pCmd, const RootDescriptorHandle* pHandle, uint3
     }
 }
 
-void util_set_heaps_graphics(Cmd* pCmd) { [pCmd->pRenderEncoder useHeaps:pCmd->pRenderer->pHeaps count:pCmd->pRenderer->mHeapCount]; }
+void util_set_heaps_graphics(Cmd* pCmd)
+{
+    // useHeaps:count: makes heap resources resident for the VERTEX and FRAGMENT stages only. A mesh
+    // pipeline reads through the OBJECT and MESH stages, so on a mesh draw every heap-backed (GPU-private)
+    // buffer the mesh shader touches was left non-resident — reads returned stale or undefined data
+    // depending on what happened to still be in cache.
+    //
+    // That is why a GPU-driven mesh raster intermittently drew nothing while the classic vertex raster was
+    // rock solid, and why buffers the CPU fills were immune: those are CPU_TO_GPU + persistently mapped
+    // (shared memory), so they are coherent regardless of heap residency. It is also why no amount of
+    // fencing helped — this is residency, not ordering, and the Metal validation layer does not flag it.
+    if (MTL_MESH_SHADER_RUNTIME)
+    {
+        [pCmd->pRenderEncoder useHeaps:pCmd->pRenderer->pHeaps
+                                 count:pCmd->pRenderer->mHeapCount
+                                stages:(MTLRenderStageVertex | MTLRenderStageFragment |
+                                        MTLRenderStageObject | MTLRenderStageMesh)];
+    }
+    else
+    {
+        [pCmd->pRenderEncoder useHeaps:pCmd->pRenderer->pHeaps count:pCmd->pRenderer->mHeapCount];
+    }
+}
 
 void util_set_heaps_compute(Cmd* pCmd) { [pCmd->pComputeEncoder useHeaps:pCmd->pRenderer->pHeaps count:pCmd->pRenderer->mHeapCount]; }
 
@@ -5944,7 +5980,9 @@ void util_end_current_encoders(Cmd* pCmd, bool forceBarrier)
 
         if (barrierRequired || forceBarrier)
         {
-            [pCmd->pRenderEncoder updateFence:pCmd->pQueue->pQueueFence afterStages:MTLRenderStageFragment];
+            pCmd->pQueue->mFenceIndex = (pCmd->pQueue->mFenceIndex + 1u) % MTL_QUEUE_FENCE_COUNT;
+            [pCmd->pRenderEncoder updateFence:pCmd->pQueue->pQueueFences[pCmd->pQueue->mFenceIndex]
+                                  afterStages:MTLRenderStageFragment];
             pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_FENCE;
         }
 
@@ -5958,7 +5996,8 @@ void util_end_current_encoders(Cmd* pCmd, bool forceBarrier)
 
         if (barrierRequired || forceBarrier)
         {
-            [pCmd->pComputeEncoder updateFence:pCmd->pQueue->pQueueFence];
+            pCmd->pQueue->mFenceIndex = (pCmd->pQueue->mFenceIndex + 1u) % MTL_QUEUE_FENCE_COUNT;
+            [pCmd->pComputeEncoder updateFence:pCmd->pQueue->pQueueFences[pCmd->pQueue->mFenceIndex]];
             pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_FENCE;
         }
 
@@ -5972,7 +6011,8 @@ void util_end_current_encoders(Cmd* pCmd, bool forceBarrier)
 
         if (barrierRequired || forceBarrier)
         {
-            [pCmd->pBlitEncoder updateFence:pCmd->pQueue->pQueueFence];
+            pCmd->pQueue->mFenceIndex = (pCmd->pQueue->mFenceIndex + 1u) % MTL_QUEUE_FENCE_COUNT;
+            [pCmd->pBlitEncoder updateFence:pCmd->pQueue->pQueueFences[pCmd->pQueue->mFenceIndex]];
             pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_FENCE;
         }
 
@@ -5989,7 +6029,8 @@ void util_end_current_encoders(Cmd* pCmd, bool forceBarrier)
 
             if (barrierRequired || forceBarrier)
             {
-                [pCmd->pASEncoder updateFence:pCmd->pQueue->pQueueFence];
+                pCmd->pQueue->mFenceIndex = (pCmd->pQueue->mFenceIndex + 1u) % MTL_QUEUE_FENCE_COUNT;
+                [pCmd->pASEncoder updateFence:pCmd->pQueue->pQueueFences[pCmd->pQueue->mFenceIndex]];
                 pCmd->pQueue->mBarrierFlags |= BARRIER_FLAG_FENCE;
             }
 
@@ -6012,7 +6053,7 @@ void util_barrier_required(Cmd* pCmd, const QueueType& encoderType)
             {
                 if (pCmd->pASEncoder != nil)
                 {
-                    [pCmd->pASEncoder waitForFence:pCmd->pQueue->pQueueFence];
+                    [pCmd->pASEncoder waitForFence:pCmd->pQueue->pQueueFences[pCmd->pQueue->mFenceIndex]];
                     issuedWait = true;
                 }
             }
@@ -6022,13 +6063,27 @@ void util_barrier_required(Cmd* pCmd, const QueueType& encoderType)
                 switch (encoderType)
                 {
                 case QUEUE_TYPE_GRAPHICS:
-                    [pCmd->pRenderEncoder waitForFence:pCmd->pQueue->pQueueFence beforeStages:MTLRenderStageVertex];
+                {
+                    // A MESH-shader pipeline runs Object -> Mesh -> Fragment and has NO vertex stage, so a
+                    // wait scheduled only beforeStages:MTLRenderStageVertex does not gate it: the object and
+                    // mesh stages may start before the fence is satisfied and read buffers a preceding
+                    // compute pass has not finished writing. Symptom: a GPU-driven mesh raster whose
+                    // indirect args and counts come from a compute cull intermittently draws NOTHING (it
+                    // reads a stale zero count), producing whole blank frames while the compute pass's own
+                    // results read back perfectly. Include the mesh stages so the wait actually covers them.
+                    MTLRenderStages BeforeStages = MTLRenderStageVertex;
+                    if (MTL_MESH_SHADER_RUNTIME)
+                    {
+                        BeforeStages |= MTLRenderStageObject | MTLRenderStageMesh;
+                    }
+                    [pCmd->pRenderEncoder waitForFence:pCmd->pQueue->pQueueFences[pCmd->pQueue->mFenceIndex] beforeStages:BeforeStages];
                     break;
+                }
                 case QUEUE_TYPE_COMPUTE:
-                    [pCmd->pComputeEncoder waitForFence:pCmd->pQueue->pQueueFence];
+                    [pCmd->pComputeEncoder waitForFence:pCmd->pQueue->pQueueFences[pCmd->pQueue->mFenceIndex]];
                     break;
                 case QUEUE_TYPE_TRANSFER:
-                    [pCmd->pBlitEncoder waitForFence:pCmd->pQueue->pQueueFence];
+                    [pCmd->pBlitEncoder waitForFence:pCmd->pQueue->pQueueFences[pCmd->pQueue->mFenceIndex]];
                     break;
                 default:
                     ASSERT(false);
@@ -6042,25 +6097,33 @@ void util_barrier_required(Cmd* pCmd, const QueueType& encoderType)
             case QUEUE_TYPE_GRAPHICS:
             {
 #if defined(ENABLE_MEMORY_BARRIERS_GRAPHICS)
+                // Same mesh-stage reasoning as the fence path above: a barrier that only names the vertex
+                // stage does not gate an Object/Mesh pipeline.
+                MTLRenderStages BeforeStages = MTLRenderStageVertex;
+                if (MTL_MESH_SHADER_RUNTIME)
+                {
+                    BeforeStages |= MTLRenderStageObject | MTLRenderStageMesh;
+                }
+
                 if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_BUFFERS)
                 {
                     [pCmd->pRenderEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers
                                                      afterStages:MTLRenderStageFragment
-                                                    beforeStages:MTLRenderStageVertex];
+                                                    beforeStages:BeforeStages];
                 }
 
                 if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_TEXTURES)
                 {
                     [pCmd->pRenderEncoder memoryBarrierWithScope:MTLBarrierScopeTextures
                                                      afterStages:MTLRenderStageFragment
-                                                    beforeStages:MTLRenderStageVertex];
+                                                    beforeStages:BeforeStages];
                 }
 
                 if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_RENDERTARGETS)
                 {
                     [pCmd->pRenderEncoder memoryBarrierWithScope:MTLBarrierScopeRenderTargets
                                                      afterStages:MTLRenderStageFragment
-                                                    beforeStages:MTLRenderStageVertex];
+                                                    beforeStages:BeforeStages];
                 }
 #endif
             }
@@ -6084,7 +6147,7 @@ void util_barrier_required(Cmd* pCmd, const QueueType& encoderType)
                 // we cant use barriers with blit encoder, only fence if available
                 if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_FENCE)
                 {
-                    [pCmd->pBlitEncoder waitForFence:pCmd->pQueue->pQueueFence];
+                    [pCmd->pBlitEncoder waitForFence:pCmd->pQueue->pQueueFences[pCmd->pQueue->mFenceIndex]];
                 }
                 break;
 
