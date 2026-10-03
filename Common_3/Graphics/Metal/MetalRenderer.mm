@@ -5619,8 +5619,10 @@ void getQueryData(Renderer* pRenderer, QueryPool* pQueryPool, uint32_t queryInde
         const double gpuSeconds = pQueryPool->pFrameCommandBuffer != nil
                                       ? pQueryPool->pFrameCommandBuffer.GPUEndTime - pQueryPool->pFrameCommandBuffer.GPUStartTime
                                       : 0.0;
-        pOutData->mBeginTimestamp = 0;
-        pOutData->mEndTimestamp = gpuSeconds > 0.0 ? (uint64_t)(gpuSeconds * GPU_FREQUENCY) : 0;
+        // The profiler reads a zero begin as an unwritten query, so a measured span starts one tick past zero;
+        // a buffer that has not completed stays [0, 0] and resolves as not yet measured.
+        pOutData->mBeginTimestamp = gpuSeconds > 0.0 ? 1 : 0;
+        pOutData->mEndTimestamp = gpuSeconds > 0.0 ? 1 + (uint64_t)(gpuSeconds * GPU_FREQUENCY) : 0;
         return;
     }
 
@@ -5702,8 +5704,10 @@ void getQueryData(Renderer* pRenderer, QueryPool* pQueryPool, uint32_t queryInde
             }
 
             sumEncoderTimestamps += util_union_encoder_windows(windows, windowCount);
-            pOutData->mBeginTimestamp = 0;
-            pOutData->mEndTimestamp = sumEncoderTimestamps * pRenderer->mGpuToCpuTimestampFactor;
+            // Spans start one tick past zero for the same reason as the frame scope above: a zero begin reads as
+            // an unwritten query. A pass that opened no encoder is a measured zero, [1, 1].
+            pOutData->mBeginTimestamp = 1;
+            pOutData->mEndTimestamp = 1 + (uint64_t)(sumEncoderTimestamps * pRenderer->mGpuToCpuTimestampFactor);
         }
         else if (pRenderer->pGpu->mDrawBoundarySamplingSupported)
         {
