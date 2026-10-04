@@ -242,6 +242,10 @@ static inline FORGE_CONSTEXPR MTLAccelerationStructureInstanceOptions ToMTLASOpt
     MTLAccelerationStructureInstanceOptions ret = MTLAccelerationStructureInstanceOptionNone;
     if (flags & ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_OPAQUE)
         ret |= MTLAccelerationStructureInstanceOptionOpaque;
+    // The geometry is built opaque, so only this instance option makes an alpha-tested instance produce
+    // candidates; without it the cut-out texels occlude like solid triangles.
+    if (flags & ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_NON_OPAQUE)
+        ret |= MTLAccelerationStructureInstanceOptionNonOpaque;
     if (flags & ACCELERATION_STRUCTURE_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE)
         ret |= MTLAccelerationStructureInstanceOptionDisableTriangleCulling;
     if (flags & ACCELERATION_STRUCTURE_INSTANCE_FLAG_TRIANGLE_FRONT_COUNTERCLOCKWISE)
