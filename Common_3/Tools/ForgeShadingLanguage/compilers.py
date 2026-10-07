@@ -299,8 +299,11 @@ def compile_binary(platform: Platforms, debug: bool, binary: ShaderBinary, src, 
             if Features.INVARIANT in binary.features:
                 params += ['-fpreserve-invariance']
             if Features.STRICT_FP in binary.features:
-                # -fno-fast-math leaves clang's default -ffp-contract=on, which still fuses a*b+c into an fma.
-                params += ['-fno-fast-math', '-ffp-contract=off']
+                # Metal compiles a shader once and never re-optimises it at run time, so its default fast-math model
+                # already repeats bit for bit for the same inputs; -fno-fast-math only bought precise transcendental
+                # math at about three times the cost per pass. Fusing a*b+c into an fma is still turned off: it
+                # changes rounding in long dependent chains enough to flip sample decisions and move the image.
+                params += ['-ffp-contract=off']
 
             params += [f"-std={util_shadertarget_metal(platform, binary)}"]
             params += ['-Wno-unused-variable']
@@ -327,8 +330,11 @@ def compile_binary(platform: Platforms, debug: bool, binary: ShaderBinary, src, 
             if Features.INVARIANT in binary.features:
                 params += ['-fpreserve-invariance']
             if Features.STRICT_FP in binary.features:
-                # -fno-fast-math leaves clang's default -ffp-contract=on, which still fuses a*b+c into an fma.
-                params += ['-fno-fast-math', '-ffp-contract=off']
+                # Metal compiles a shader once and never re-optimises it at run time, so its default fast-math model
+                # already repeats bit for bit for the same inputs; -fno-fast-math only bought precise transcendental
+                # math at about three times the cost per pass. Fusing a*b+c into an fma is still turned off: it
+                # changes rounding in long dependent chains enough to flip sample decisions and move the image.
+                params += ['-ffp-contract=off']
 
             params += [f"-std={util_shadertarget_metal(platform, binary)}"]
             params += ['-Wno-unused-variable']
