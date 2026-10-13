@@ -363,12 +363,28 @@ void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructu
         MTLAccelerationStructureInstanceDescriptor* instanceDescs =
             (MTLAccelerationStructureInstanceDescriptor*)pAS->pInstanceDescBuffer->pCpuMappedAddress;
 
+        // Each distinct bottom-level structure is listed once and every instance names it by its position in
+        // that list. Looking the position up with indexOfObject: on a list with one entry per instance cost
+        // O(instances^2) on the CPU at every rebuild (about 1.4e8 compares for 17k instances); a pointer-keyed
+        // map makes it one lookup per instance.
         NSMutableArray<id<MTLAccelerationStructure>>* primitiveASArray = [[NSMutableArray alloc] init];
+        NSMutableDictionary<NSValue*, NSNumber*>*      primitiveASIndex = [[NSMutableDictionary alloc] init];
+        uint32_t*                                      instanceASIndex =
+            (uint32_t*)tf_malloc(sizeof(uint32_t) * (pDesc->mTop.mDescCount > 0 ? pDesc->mTop.mDescCount : 1));
 
         for (uint32_t i = 0; i < pDesc->mTop.mDescCount; ++i)
         {
             AccelerationStructureInstanceDesc* pInst = &pDesc->mTop.pInstanceDescs[i];
-            [primitiveASArray addObject:pInst->pBottomAS->mAS];
+            ASSERT(pInst->pBottomAS);
+            NSValue*  key = [NSValue valueWithPointer:(__bridge const void*)pInst->pBottomAS->mAS];
+            NSNumber* known = primitiveASIndex[key];
+            if (known == nil)
+            {
+                known = @((uint32_t)[primitiveASArray count]);
+                primitiveASIndex[key] = known;
+                [primitiveASArray addObject:pInst->pBottomAS->mAS];
+            }
+            instanceASIndex[i] = [known unsignedIntValue];
         }
 
         for (uint32_t i = 0; i < pDesc->mTop.mDescCount; ++i)
@@ -381,7 +397,7 @@ void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructu
             // so every field of the descriptor has to be written — a stale offset here would send hits
             // to the wrong intersection function.
             instanceDescs[i].intersectionFunctionTableOffset = pInst->mInstanceContributionToHitGroupIndex;
-            instanceDescs[i].accelerationStructureIndex = (uint32_t)[primitiveASArray indexOfObject:pInst->pBottomAS->mAS];
+            instanceDescs[i].accelerationStructureIndex = instanceASIndex[i];
             // Copy the first three rows of the instance transformation matrix. Metal
             // assumes that the bottom row is (0, 0, 0, 1), which allows the renderer to
             // tightly pack instance descriptors in memory.
@@ -393,6 +409,8 @@ void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructu
                 }
             }
         }
+
+        tf_free(instanceASIndex);
 
         asDesc.instanceCount = pAS->mDescCount;
         asDesc.instanceDescriptorBuffer = pAS->pInstanceDescBuffer->pBuffer;
