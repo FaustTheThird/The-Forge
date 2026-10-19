@@ -2966,6 +2966,12 @@ void addPipelineStats(Renderer* pRenderer, Pipeline* pPipeline, bool generateDis
 void removePipelineStats(Renderer* pRenderer, PipelineStats* pStats);
 #endif
 void removePipelineCache(Renderer* pRenderer, PipelineCache* pPipelineCache);
+#if defined(METAL)
+// Opens a Metal binary archive of prebuilt compute pipelines and attaches it to every compute pipeline created
+// afterwards, so a pipeline the archive holds for this GPU and OS is not compiled again. A missing or unreadable
+// archive (one written for another GPU or OS) is not an error: it returns false and pipelines compile as before.
+bool mtlLoadPipelineArchive(Renderer* pRenderer, const char* pPath);
+#endif
 
 // Descriptor Set functions
 void addDescriptorSet(Renderer* pRenderer, const DescriptorSetDesc* pDesc, DescriptorSet** ppDescriptorSet);

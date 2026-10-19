@@ -75,6 +75,11 @@
 #define VERTEX_BINDING_OFFSET          (MAX_BUFFER_BINDINGS - 1)
 #define DESCRIPTOR_UPDATE_FREQ_PADDING 0
 
+// The compute pipelines prebuilt for this machine's GPU, attached to every compute pipeline created after
+// mtlLoadPipelineArchive. Compiling a large ray-tracing kernel from its library takes the GPU compiler tens of
+// seconds on a first launch; the archive turns that into a lookup.
+static id<MTLBinaryArchive> gPipelineArchive = nil;
+
 VkAllocationCallbacks gMtlAllocationCallbacks = {
     // pUserData
     NULL,
@@ -2663,6 +2668,11 @@ void exitRenderer(Renderer* pRenderer)
 
     remove_default_resources(pRenderer);
 
+    if (gPipelineArchive && gPipelineArchive.device == pRenderer->pDevice)
+    {
+        gPipelineArchive = nil;
+    }
+
     if (pRenderer->pGpu->mPlacementHeaps)
     {
         vmaDestroyAllocator(pRenderer->pVmaAllocator);
@@ -3864,6 +3874,39 @@ void addMeshPipelineImpl(Renderer* pRenderer, const char* pName, const MeshPipel
 }
 #endif // ENABLE_MESH_SHADER
 
+bool mtlLoadPipelineArchive(Renderer* pRenderer, const char* pPath)
+{
+    ASSERT(pRenderer);
+    gPipelineArchive = nil;
+    if (!pPath)
+    {
+        return false;
+    }
+    @autoreleasepool
+    {
+        NSString* path = [NSString stringWithUTF8String:pPath];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path])
+        {
+            LOGF(LogLevel::eINFO, "Metal: no pipeline archive at %s; compute pipelines compile on creation", pPath);
+            return false;
+        }
+        MTLBinaryArchiveDescriptor* archiveDesc = [[MTLBinaryArchiveDescriptor alloc] init];
+        archiveDesc.url = [NSURL fileURLWithPath:path];
+        NSError* error = nil;
+        id<MTLBinaryArchive> archive = [pRenderer->pDevice newBinaryArchiveWithDescriptor:archiveDesc error:&error];
+        if (!archive)
+        {
+            // An archive written for another GPU or OS can be refused outright; the pipelines then compile.
+            LOGF(LogLevel::eWARNING, "Metal: pipeline archive %s could not be opened (%s); compute pipelines compile on creation",
+                 pPath, [error.localizedDescription UTF8String]);
+            return false;
+        }
+        gPipelineArchive = archive;
+    }
+    LOGF(LogLevel::eINFO, "Metal: compute pipelines are looked up in the archive %s", pPath);
+    return true;
+}
+
 void addComputePipelineImpl(Renderer* pRenderer, const char* pName, const ComputePipelineDesc* pDesc, Pipeline** ppPipeline)
 {
     ASSERT(pRenderer);
@@ -3881,6 +3924,12 @@ void addComputePipelineImpl(Renderer* pRenderer, const char* pName, const Comput
 
     MTLComputePipelineDescriptor* pipelineDesc = [[MTLComputePipelineDescriptor alloc] init];
     pipelineDesc.computeFunction = pDesc->pShaderProgram->pComputeShader;
+    // A pipeline the archive holds for this GPU and OS is taken from it instead of being compiled; without
+    // MTLPipelineOptionFailOnBinaryArchiveMiss any other pipeline compiles exactly as it would with no archive.
+    if (gPipelineArchive && gPipelineArchive.device == pRenderer->pDevice)
+    {
+        pipelineDesc.binaryArchives = @[ gPipelineArchive ];
+    }
 #if defined(ENABLE_GRAPHICS_DEBUG_ANNOTATION)
     if (pName)
     {
