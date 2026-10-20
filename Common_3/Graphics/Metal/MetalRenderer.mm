@@ -80,25 +80,36 @@
 // mtlLoadPipelineArchive. Compiling a large ray-tracing kernel from its library takes the GPU compiler tens of
 // seconds on a first launch; the archive turns that into a lookup.
 static id<MTLBinaryArchive> gPipelineArchive = nil;
-// The first compute pipeline created with the archive attached checks that the archive serves this GPU and OS;
-// until then this is false. An archive that does not is detached, so no later pipeline carries it.
+/// The first compute pipeline the archive's own kernel list (<archive>.kernels, written by the tool that built it)
+// names checks that the archive serves this GPU and OS; until then this is false. An archive that does not is
+// detached, so no later pipeline carries it. A pipeline the list does not name (a kernel the tool could not add, or a
+// shader built at run time) is never the check: missing from the archive is expected for it.
 static bool gPipelineArchiveChecked = false;
+static NSSet<NSString*>* gPipelineArchiveKernels = nil;
 
 // How long opening the archive may take before it is given up on. Opening maps the file and reads its header, a few
-// milliseconds; a file system that stalls must not hold the renderer's start for longer than this.
-static const int64_t PipelineArchiveOpenTimeoutNs = 10ll * NSEC_PER_SEC;
+// milliseconds; the limit stays under the couple of seconds after which the OS marks an app that is not answering
+// its events as hung, because this wait runs on the thread that answers them.
+static const int64_t PipelineArchiveOpenTimeoutNs = 2ll * NSEC_PER_SEC;
 
 // Pipeline states are created on worker threads: the GPU compiler runs one pipeline per thread, and a first launch
 // that misses every cache spends minutes in it, so pipelines compile side by side instead of one after another.
-// addPipeline returns at once with the state still being made; mtlWaitForPipelines waits for it, and every use of a
-// pipeline (binding it, removing it, tearing the renderer down) waits first, so nothing ever sees a state that is
-// not there yet. The descriptors, and so the pipelines, are exactly the ones a synchronous creation makes.
-static dispatch_queue_t     gPipelineQueue = nil;
-static dispatch_group_t     gPipelineGroup = nil;
-static dispatch_semaphore_t gPipelineSlots = nil;
-static uint32_t             gPipelinesRequested = 0;
-static uint32_t             gPipelinesCompleted = 0;
-static uint32_t             gPipelinesPending = 0;
+// addPipeline returns at once with the state still being made. Using a pipeline (binding it, removing it) waits for
+// that pipeline alone, and a thread that needs one nobody has started runs it itself rather than queueing behind the
+// others; mtlWaitForPipelines waits for all of them, and tearing the renderer down does too. The descriptors, and so
+// the pipelines, are exactly the ones a synchronous creation makes. A creation that fails is answered by
+// mtlPipelineFailed, so a caller that turned itself off on a missing pipeline still can.
+typedef BOOL (^PipelineCreation)(void);
+static NSOperationQueue* gPipelineQueue = nil;
+// Guards the two collections below and is signalled whenever a creation finishes.
+static NSCondition* gPipelineCondition = nil;
+// The creations queued and not yet started, by pipeline.
+static NSMutableDictionary<NSValue*, PipelineCreation>* gPipelineCreations = nil;
+// The pipelines being created right now, on a worker or on a thread that needed one.
+static NSMutableSet<NSValue*>* gPipelinesRunning = nil;
+static uint32_t gPipelinesRequested = 0;
+static uint32_t gPipelinesCompleted = 0;
+static uint32_t gPipelinesInFlight = 0;
 
 // A large ray-tracing kernel takes the GPU compiler gigabytes of memory, so the number compiled at once is bounded by
 // the machine's memory as well as by its performance cores: running more than fit would page instead of compiling.
@@ -125,31 +136,84 @@ static uint32_t mtlPipelineCompileSlots()
     return slots;
 }
 
-// Runs one pipeline creation on a worker. The block owns everything it reads (the descriptor and the pipeline it
-// fills), so it outlives the addPipeline call that queued it.
-static void mtlCreatePipelineAsync(void (^create)(void))
+static void mtlInitPipelineCreation()
 {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         const uint32_t slots = mtlPipelineCompileSlots();
-        gPipelineQueue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
-        gPipelineGroup = dispatch_group_create();
-        gPipelineSlots = dispatch_semaphore_create(slots);
+        gPipelineQueue = [[NSOperationQueue alloc] init];
+        gPipelineQueue.name = @"Metal pipeline creation";
+        gPipelineQueue.maxConcurrentOperationCount = (NSInteger)slots;
+        gPipelineQueue.qualityOfService = NSQualityOfServiceUserInitiated;
+        gPipelineCondition = [[NSCondition alloc] init];
+        gPipelineCreations = [[NSMutableDictionary alloc] init];
+        gPipelinesRunning = [[NSMutableSet alloc] init];
         LOGF(LogLevel::eINFO, "Metal: pipelines are created on up to %u worker threads", slots);
     });
+}
+
+// Runs the creation queued for pPipeline on the calling thread, unless it has already started or finished.
+static void mtlRunPipelineCreation(Pipeline* pPipeline)
+{
+    NSValue* key = [NSValue valueWithPointer:pPipeline];
+    [gPipelineCondition lock];
+    PipelineCreation create = gPipelineCreations[key];
+    if (create)
+    {
+        [gPipelineCreations removeObjectForKey:key];
+        [gPipelinesRunning addObject:key];
+    }
+    [gPipelineCondition unlock];
+    if (!create)
+    {
+        return;
+    }
+    BOOL created = NO;
+    @autoreleasepool
+    {
+        created = create();
+    }
+    [gPipelineCondition lock];
+    pPipeline->mCreationFailed = created ? 0u : 1u;
+    [gPipelinesRunning removeObject:key];
+    __atomic_fetch_add(&gPipelinesCompleted, 1u, __ATOMIC_RELAXED);
+    // Release: a reader that sees the count drop also sees the state the creation stored.
+    __atomic_fetch_sub(&gPipelinesInFlight, 1u, __ATOMIC_RELEASE);
+    [gPipelineCondition broadcast];
+    [gPipelineCondition unlock];
+}
+
+// Queues one pipeline creation. The block owns everything it reads (the descriptor and the pipeline it fills), so it
+// outlives the addPipeline call that queued it; it answers whether the state was made.
+static void mtlCreatePipelineAsync(Pipeline* pPipeline, PipelineCreation create)
+{
+    mtlInitPipelineCreation();
+    [gPipelineCondition lock];
+    gPipelineCreations[[NSValue valueWithPointer:pPipeline]] = create;
     __atomic_fetch_add(&gPipelinesRequested, 1u, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&gPipelinesPending, 1u, __ATOMIC_RELAXED);
-    dispatch_group_async(gPipelineGroup, gPipelineQueue, ^{
-        dispatch_semaphore_wait(gPipelineSlots, DISPATCH_TIME_FOREVER);
-        @autoreleasepool
-        {
-            create();
-        }
-        dispatch_semaphore_signal(gPipelineSlots);
-        __atomic_fetch_add(&gPipelinesCompleted, 1u, __ATOMIC_RELAXED);
-        // Release: a reader that sees the count drop also sees the state the block just stored.
-        __atomic_fetch_sub(&gPipelinesPending, 1u, __ATOMIC_RELEASE);
-    });
+    __atomic_fetch_add(&gPipelinesInFlight, 1u, __ATOMIC_RELAXED);
+    [gPipelineCondition unlock];
+    [gPipelineQueue addOperationWithBlock:^{
+        mtlRunPipelineCreation(pPipeline);
+    }];
+}
+
+// Waits until pPipeline's state exists (or its creation failed), running its creation here if nobody has started it.
+// One atomic load once nothing is being created.
+static void mtlWaitForPipeline(Pipeline* pPipeline)
+{
+    if (__atomic_load_n(&gPipelinesInFlight, __ATOMIC_ACQUIRE) == 0)
+    {
+        return;
+    }
+    mtlRunPipelineCreation(pPipeline);
+    NSValue* key = [NSValue valueWithPointer:pPipeline];
+    [gPipelineCondition lock];
+    while ([gPipelinesRunning containsObject:key])
+    {
+        [gPipelineCondition wait];
+    }
+    [gPipelineCondition unlock];
 }
 
 void mtlGetPipelineProgress(uint32_t* pCompleted, uint32_t* pRequested)
@@ -166,29 +230,36 @@ void mtlGetPipelineProgress(uint32_t* pCompleted, uint32_t* pRequested)
 
 bool mtlWaitForPipelines(uint32_t timeoutMs)
 {
-    if (__atomic_load_n(&gPipelinesPending, __ATOMIC_ACQUIRE) == 0)
+    if (__atomic_load_n(&gPipelinesInFlight, __ATOMIC_ACQUIRE) == 0)
     {
         return true;
     }
-    dispatch_time_t deadline = DISPATCH_TIME_FOREVER;
+    NSDate* deadline = [NSDate distantFuture];
     if (timeoutMs != UINT32_MAX)
     {
-        deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutMs * NSEC_PER_MSEC);
+        deadline = [NSDate dateWithTimeIntervalSinceNow:timeoutMs / 1000.0];
     }
-    if (dispatch_group_wait(gPipelineGroup, deadline) != 0)
+    [gPipelineCondition lock];
+    while (__atomic_load_n(&gPipelinesInFlight, __ATOMIC_ACQUIRE) != 0)
     {
-        return false;
+        if (![gPipelineCondition waitUntilDate:deadline])
+        {
+            break;
+        }
     }
-    return __atomic_load_n(&gPipelinesPending, __ATOMIC_ACQUIRE) == 0;
+    const bool done = __atomic_load_n(&gPipelinesInFlight, __ATOMIC_ACQUIRE) == 0;
+    [gPipelineCondition unlock];
+    return done;
 }
 
-// Every use of a pipeline goes through here first; it costs one atomic load once nothing is being created.
-static inline void mtlEnsurePipelinesCreated()
+bool mtlPipelineFailed(Pipeline* pPipeline)
 {
-    if (__atomic_load_n(&gPipelinesPending, __ATOMIC_ACQUIRE) != 0)
+    if (!pPipeline)
     {
-        mtlWaitForPipelines(UINT32_MAX);
+        return true;
     }
+    mtlWaitForPipeline(pPipeline);
+    return pPipeline->mCreationFailed != 0;
 }
 
 VkAllocationCallbacks gMtlAllocationCallbacks = {
@@ -2776,7 +2847,7 @@ void initRenderer(const char* appName, const RendererDesc* settings, Renderer** 
 void exitRenderer(Renderer* pRenderer)
 {
     ASSERT(pRenderer);
-    mtlEnsurePipelinesCreated();
+    mtlWaitForPipelines(UINT32_MAX);
 
     remove_default_resources(pRenderer);
 
@@ -3881,7 +3952,7 @@ void addGraphicsPipelineImpl(Renderer* pRenderer, const char* pName, const Graph
     // create pipeline from descriptor, on a worker like every compute pipeline (mtlCreatePipelineAsync)
     *ppPipeline = pPipeline;
     id<MTLDevice> device = pRenderer->pDevice;
-    mtlCreatePipelineAsync(^{
+    mtlCreatePipelineAsync(pPipeline, ^BOOL {
         NSError* error = nil;
         pPipeline->pRenderPipelineState = [device newRenderPipelineStateWithDescriptor:renderPipelineDesc
                                                                                options:MTLPipelineOptionNone
@@ -3891,7 +3962,9 @@ void addGraphicsPipelineImpl(Renderer* pRenderer, const char* pName, const Graph
         {
             LOGF(LogLevel::eERROR, "Failed to create render pipeline state for %s, error:\n%s",
                  [renderPipelineDesc.vertexFunction.name UTF8String], [error.description UTF8String]);
+            return NO;
         }
+        return YES;
     });
 }
 
@@ -3994,6 +4067,7 @@ bool mtlLoadPipelineArchive(Renderer* pRenderer, const char* pPath)
     ASSERT(pRenderer);
     gPipelineArchive = nil;
     gPipelineArchiveChecked = false;
+    gPipelineArchiveKernels = nil;
     if (!pPath)
     {
         return false;
@@ -4028,8 +4102,8 @@ bool mtlLoadPipelineArchive(Renderer* pRenderer, const char* pPath)
         });
         if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, PipelineArchiveOpenTimeoutNs)) != 0)
         {
-            LOGF(LogLevel::eWARNING, "Metal: the pipeline archive %s did not open within %lld s; compute pipelines compile on creation",
-                 pPath, (long long)(PipelineArchiveOpenTimeoutNs / (int64_t)NSEC_PER_SEC));
+            LOGF(LogLevel::eWARNING, "Metal: the pipeline archive %s did not open within %lld ms; compute pipelines compile on creation",
+                 pPath, (long long)(PipelineArchiveOpenTimeoutNs / (int64_t)NSEC_PER_MSEC));
             return false;
         }
         if (!opened)
@@ -4040,15 +4114,40 @@ bool mtlLoadPipelineArchive(Renderer* pRenderer, const char* pPath)
             return false;
         }
         gPipelineArchive = opened;
+
+        // The kernels the archive was built with, one function name a line, beside it. Without the list the archive
+        // stays attached unchecked: a pipeline it lacks compiles as it would with no archive.
+        NSString* list = [NSString stringWithContentsOfFile:[path stringByAppendingString:@".kernels"]
+                                                   encoding:NSUTF8StringEncoding
+                                                      error:nil];
+        if (list)
+        {
+            NSMutableSet<NSString*>* kernels = [NSMutableSet set];
+            for (NSString* line in [list componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]])
+            {
+                if (line.length > 0)
+                {
+                    [kernels addObject:line];
+                }
+            }
+            gPipelineArchiveKernels = kernels;
+            LOGF(LogLevel::eINFO, "Metal: the pipeline archive lists %u kernels; the first of them created checks it",
+                 (uint32_t)kernels.count);
+        }
+        else
+        {
+            LOGF(LogLevel::eWARNING, "Metal: the pipeline archive %s has no kernel list beside it, so it is not checked", pPath);
+        }
     }
     LOGF(LogLevel::eINFO, "Metal: compute pipelines are looked up in the archive %s", pPath);
     return true;
 }
 
-// The first compute pipeline made with the archive attached is made with MTLPipelineOptionFailOnBinaryArchiveMiss,
-// which answers at once whether the archive holds pipelines for this GPU and OS. A hit is that pipeline, ready. A miss
-// detaches the archive, so every pipeline from then on is created exactly as it is without one, and returns nil for
-// the caller to create this pipeline the normal way.
+// The first compute pipeline made with the archive attached whose kernel the archive's list names is made with
+// MTLPipelineOptionFailOnBinaryArchiveMiss, which answers at once whether the archive holds pipelines for this GPU and
+// OS. A hit is that pipeline, ready. A miss means the archive was built for another GPU or macOS version: it detaches
+// the archive, so every pipeline from then on is created exactly as it is without one, and returns nil for the caller
+// to create this pipeline the normal way.
 static id<MTLComputePipelineState> mtlCheckPipelineArchive(Renderer* pRenderer, MTLComputePipelineDescriptor* pipelineDesc)
 {
     gPipelineArchiveChecked = true;
@@ -4062,7 +4161,8 @@ static id<MTLComputePipelineState> mtlCheckPipelineArchive(Renderer* pRenderer, 
         LOGF(LogLevel::eINFO, "Metal: the pipeline archive serves this GPU (%s)", [pRenderer->pDevice.name UTF8String]);
         return state;
     }
-    LOGF(LogLevel::eWARNING, "Metal: the pipeline archive holds no pipelines for this GPU (%s) and OS, so it is not used: %s",
+    LOGF(LogLevel::eWARNING, "Metal: the pipeline archive lists %s but holds no pipeline for it on this GPU (%s) and "
+         "macOS, so it was built for another and is not used: %s", [pipelineDesc.computeFunction.name UTF8String],
          [pRenderer->pDevice.name UTF8String], [error.localizedDescription UTF8String]);
     gPipelineArchive = nil;
     pipelineDesc.binaryArchives = nil;
@@ -4097,7 +4197,7 @@ void addComputePipelineImpl(Renderer* pRenderer, const char* pName, const Comput
     if (gPipelineArchive && gPipelineArchive.device == pRenderer->pDevice)
     {
         pipelineDesc.binaryArchives = @[ gPipelineArchive ];
-        if (!gPipelineArchiveChecked)
+        if (!gPipelineArchiveChecked && [gPipelineArchiveKernels containsObject:pipelineDesc.computeFunction.name])
         {
             pPipeline->pComputePipelineState = mtlCheckPipelineArchive(pRenderer, pipelineDesc);
         }
@@ -4110,7 +4210,7 @@ void addComputePipelineImpl(Renderer* pRenderer, const char* pName, const Comput
     }
 
     id<MTLDevice> device = pRenderer->pDevice;
-    mtlCreatePipelineAsync(^{
+    mtlCreatePipelineAsync(pPipeline, ^BOOL {
         NSError* error = nil;
         pPipeline->pComputePipelineState = [device newComputePipelineStateWithDescriptor:pipelineDesc
                                                                                  options:MTLPipelineOptionNone
@@ -4120,7 +4220,9 @@ void addComputePipelineImpl(Renderer* pRenderer, const char* pName, const Comput
         {
             LOGF(LogLevel::eERROR, "Failed to create compute pipeline state for %s, error:\n%s",
                  [pipelineDesc.computeFunction.name UTF8String], [error.description UTF8String]);
+            return NO;
         }
+        return YES;
     });
 }
 
@@ -4163,7 +4265,7 @@ void removePipeline(Renderer* pRenderer, Pipeline* pPipeline)
 {
     ASSERT(pPipeline);
     // A worker may still be filling this pipeline in.
-    mtlEnsurePipelinesCreated();
+    mtlWaitForPipeline(pPipeline);
 
     pPipeline->pRenderPipelineState = nil;
     pPipeline->pComputePipelineState = nil;
@@ -4539,11 +4641,29 @@ void cmdSetStencilReferenceValue(Cmd* pCmd, uint32_t val)
     [pCmd->pRenderEncoder setStencilReferenceValue:val];
 }
 
+// A pipeline whose creation failed is never bound, and the draws and dispatches recorded with it are skipped, so a
+// caller that did not ask mtlPipelineFailed loses that work instead of running a nil state or the previous one.
+static inline bool mtlBoundPipelineFailed(Cmd* pCmd)
+{
+    return pCmd->pBoundPipeline && pCmd->pBoundPipeline->mCreationFailed;
+}
+
 void cmdBindPipeline(Cmd* pCmd, Pipeline* pPipeline)
 {
     ASSERT(pCmd);
     ASSERT(pPipeline);
-    mtlEnsurePipelinesCreated();
+    mtlWaitForPipeline(pPipeline);
+    if (pPipeline->mCreationFailed)
+    {
+        static bool reported = false;
+        if (!reported)
+        {
+            reported = true;
+            LOGF(LogLevel::eERROR, "Metal: a pipeline whose creation failed was bound; its draws and dispatches are skipped");
+        }
+        pCmd->pBoundPipeline = pPipeline;
+        return;
+    }
 
     pCmd->pBoundPipeline = pPipeline;
     pCmd->mShouldRebindPipeline = 0;
@@ -4680,6 +4800,10 @@ void RebindState(Cmd* pCmd)
 void cmdDraw(Cmd* pCmd, uint32_t vertexCount, uint32_t firstVertex)
 {
     ASSERT(pCmd);
+    if (mtlBoundPipelineFailed(pCmd))
+    {
+        return;
+    }
 
     RebindState(pCmd);
 
@@ -4704,6 +4828,10 @@ void cmdDraw(Cmd* pCmd, uint32_t vertexCount, uint32_t firstVertex)
 void cmdDrawInstanced(Cmd* pCmd, uint32_t vertexCount, uint32_t firstVertex, uint32_t instanceCount, uint32_t firstInstance)
 {
     ASSERT(pCmd);
+    if (mtlBoundPipelineFailed(pCmd))
+    {
+        return;
+    }
 
     RebindState(pCmd);
 
@@ -4740,6 +4868,10 @@ void cmdDrawInstanced(Cmd* pCmd, uint32_t vertexCount, uint32_t firstVertex, uin
 void cmdDrawIndexed(Cmd* pCmd, uint32_t indexCount, uint32_t firstIndex, uint32_t firstVertex)
 {
     ASSERT(pCmd);
+    if (mtlBoundPipelineFailed(pCmd))
+    {
+        return;
+    }
 
     RebindState(pCmd);
 
@@ -4826,6 +4958,10 @@ void cmdDrawIndexedInstanced(Cmd* pCmd, uint32_t indexCount, uint32_t firstIndex
                              uint32_t firstInstance)
 {
     ASSERT(pCmd);
+    if (mtlBoundPipelineFailed(pCmd))
+    {
+        return;
+    }
 
     RebindState(pCmd);
 
@@ -4921,6 +5057,10 @@ void cmdDrawIndexedInstanced(Cmd* pCmd, uint32_t indexCount, uint32_t firstIndex
 void cmdDispatch(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
 {
     ASSERT(pCmd);
+    if (mtlBoundPipelineFailed(pCmd))
+    {
+        return;
+    }
     ASSERT(pCmd->pComputeEncoder != nil);
 
     // There might have been a barrier inserted since last dispatch call
@@ -4936,6 +5076,10 @@ void cmdDispatch(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t
 void cmdDispatchMesh(Cmd* pCmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
 {
     ASSERT(pCmd);
+    if (mtlBoundPipelineFailed(pCmd))
+    {
+        return;
+    }
     ASSERT(pCmd->pBoundPipeline);
     ASSERT(pCmd->pBoundPipeline->mType == PIPELINE_TYPE_MESH);
 
@@ -4974,6 +5118,10 @@ void cmdExecuteIndirect(Cmd* pCmd, IndirectArgumentType type, uint maxCommandCou
                         Buffer* pCounterBuffer, uint64_t counterBufferOffset)
 {
     ASSERT(pCmd);
+    if (mtlBoundPipelineFailed(pCmd))
+    {
+        return;
+    }
 
     RebindState(pCmd);
 
