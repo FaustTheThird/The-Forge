@@ -2970,7 +2970,16 @@ void removePipelineCache(Renderer* pRenderer, PipelineCache* pPipelineCache);
 // Opens a Metal binary archive of prebuilt compute pipelines and attaches it to every compute pipeline created
 // afterwards, so a pipeline the archive holds for this GPU and OS is not compiled again. A missing or unreadable
 // archive (one written for another GPU or OS) is not an error: it returns false and pipelines compile as before.
+// The open is given a time limit, and the first compute pipeline created afterwards checks that the archive serves
+// this GPU and OS; one that does not is detached, so no later pipeline carries it.
 bool mtlLoadPipelineArchive(Renderer* pRenderer, const char* pPath);
+// Compute and graphics pipeline states are created on worker threads, several at a time: addPipeline returns before
+// the state exists, and binding or removing any pipeline waits for every creation still in flight. These let a caller
+// wait itself, in steps, so it can report progress (and keep its window answering) while the GPU compiler runs.
+// The counts cover every pipeline created so far. mtlWaitForPipelines returns true once none is in flight and false
+// when timeoutMs ran out first (UINT32_MAX waits for as long as it takes).
+void mtlGetPipelineProgress(uint32_t* pCompleted, uint32_t* pRequested);
+bool mtlWaitForPipelines(uint32_t timeoutMs);
 #endif
 
 // Descriptor Set functions
