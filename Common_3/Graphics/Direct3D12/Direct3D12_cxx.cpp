@@ -283,4 +283,243 @@ extern "C" HRESULT Bloom_CreateMeshPipelineState(
     desc.pPipelineStateSubobjectStream = &s;
     return pDevice2->CreatePipelineState(&desc, IID_PPV_ARGS(ppOut));
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Pipeline states created on worker threads.
+//
+// The driver compiles a pipeline's shaders into the GPU's code when its state is created, which takes from under a
+// millisecond to seconds for a large kernel, and it can do several at once. addPipeline therefore hands the creation to
+// a worker and returns the pipeline at once; the first thread that needs the state (binding or removing the pipeline,
+// or a caller asking whether it failed) waits for that one pipeline, and runs the job itself when no worker has started
+// it, so a pipeline needed now never queues behind others. Creation is free-threaded in Direct3D 12; each job owns
+// everything it reads.
+// ---------------------------------------------------------------------------------------------------------------------
+
+#include "../Interfaces/IGraphics.h"
+#include "../../Utilities/Interfaces/ILog.h"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+struct D3D12PipelineJob
+{
+    void*                   pData = nullptr;
+    D3D12PipelineJobRun     pRun = nullptr;
+    D3D12PipelineJobRelease pRelease = nullptr;
+};
+
+struct D3D12PipelineQueue
+{
+    std::mutex mLock;
+    // Signalled when a job is queued (for the workers) and when one finishes (for the threads waiting on it).
+    std::condition_variable                         mQueued;
+    std::condition_variable                         mFinished;
+    std::deque<Pipeline*>                           mOrder;
+    std::unordered_map<Pipeline*, D3D12PipelineJob> mJobs;
+    std::unordered_set<Pipeline*>                   mRunning;
+    std::vector<std::thread>                        mWorkers;
+    bool                                            mStopping = false;
+    std::atomic<uint32_t>                           mInFlight{ 0 };
+    std::atomic<uint32_t>                           mRequested{ 0 };
+    std::atomic<uint32_t>                           mCompleted{ 0 };
+    std::atomic<uint64_t>                           mWaitedUs{ 0 };
+};
+
+static D3D12PipelineQueue gPipelineQueue;
+
+// Several compiles at once, leaving cores for the frame and the rest of the process.
+static uint32_t d3d12PipelineWorkerCount()
+{
+    const uint32_t cores = std::thread::hardware_concurrency();
+    const uint32_t workers = cores > 4u ? cores / 2u : 1u;
+    return workers > 8u ? 8u : workers;
+}
+
+// Runs a job taken out of the queue (pPipeline is in mRunning) and publishes its result.
+static void d3d12RunPipelineJob(Pipeline* pPipeline, const D3D12PipelineJob& job)
+{
+    const BOOL created = job.pRun(job.pData);
+    job.pRelease(job.pData);
+    std::lock_guard<std::mutex> guard(gPipelineQueue.mLock);
+    pPipeline->mDx.mCreationFailed = created ? 0u : 1u;
+    gPipelineQueue.mRunning.erase(pPipeline);
+    gPipelineQueue.mCompleted.fetch_add(1u, std::memory_order_relaxed);
+    gPipelineQueue.mInFlight.fetch_sub(1u, std::memory_order_release);
+    gPipelineQueue.mFinished.notify_all();
+}
+
+// Takes the next queued job, or returns false once the queue is stopping and empty.
+static bool d3d12TakePipelineJob(Pipeline** ppPipeline, D3D12PipelineJob* pJob)
+{
+    std::unique_lock<std::mutex> lock(gPipelineQueue.mLock);
+    for (;;)
+    {
+        gPipelineQueue.mQueued.wait(lock, [] { return gPipelineQueue.mStopping || !gPipelineQueue.mOrder.empty(); });
+        if (gPipelineQueue.mOrder.empty())
+        {
+            return false;
+        }
+        Pipeline* pPipeline = gPipelineQueue.mOrder.front();
+        gPipelineQueue.mOrder.pop_front();
+        const auto found = gPipelineQueue.mJobs.find(pPipeline);
+        if (found == gPipelineQueue.mJobs.end())
+        {
+            // A thread that needed it ran it already.
+            continue;
+        }
+        *pJob = found->second;
+        gPipelineQueue.mJobs.erase(found);
+        gPipelineQueue.mRunning.insert(pPipeline);
+        *ppPipeline = pPipeline;
+        return true;
+    }
+}
+
+static void d3d12PipelineWorker()
+{
+    Pipeline*        pPipeline = nullptr;
+    D3D12PipelineJob job;
+    while (d3d12TakePipelineJob(&pPipeline, &job))
+    {
+        d3d12RunPipelineJob(pPipeline, job);
+    }
+}
+
+extern "C" void d3d12CreatePipelineAsync(Pipeline* pPipeline, void* pJob, D3D12PipelineJobRun run,
+                                         D3D12PipelineJobRelease release)
+{
+    std::lock_guard<std::mutex> guard(gPipelineQueue.mLock);
+    if (gPipelineQueue.mWorkers.empty())
+    {
+        gPipelineQueue.mStopping = false;
+        const uint32_t count = d3d12PipelineWorkerCount();
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            gPipelineQueue.mWorkers.emplace_back(d3d12PipelineWorker);
+        }
+        LOGF(eINFO, "D3D12: pipelines are created on up to %u worker threads", count);
+    }
+    gPipelineQueue.mJobs[pPipeline] = D3D12PipelineJob{ pJob, run, release };
+    gPipelineQueue.mOrder.push_back(pPipeline);
+    gPipelineQueue.mRequested.fetch_add(1u, std::memory_order_relaxed);
+    gPipelineQueue.mInFlight.fetch_add(1u, std::memory_order_relaxed);
+    gPipelineQueue.mQueued.notify_one();
+}
+
+// Takes pPipeline's job out of the queue for the calling thread to run (true), or waits while a worker runs it.
+static bool d3d12ClaimOrAwaitPipeline(Pipeline* pPipeline, D3D12PipelineJob* pJob, bool* pWaited)
+{
+    std::unique_lock<std::mutex> lock(gPipelineQueue.mLock);
+    const auto                   found = gPipelineQueue.mJobs.find(pPipeline);
+    if (found != gPipelineQueue.mJobs.end())
+    {
+        *pJob = found->second;
+        gPipelineQueue.mJobs.erase(found);
+        gPipelineQueue.mRunning.insert(pPipeline);
+        return true;
+    }
+    if (gPipelineQueue.mRunning.count(pPipeline) != 0u)
+    {
+        *pWaited = true;
+        gPipelineQueue.mFinished.wait(lock, [pPipeline] { return gPipelineQueue.mRunning.count(pPipeline) == 0u; });
+    }
+    return false;
+}
+
+extern "C" void d3d12WaitForPipeline(Pipeline* pPipeline)
+{
+    if (gPipelineQueue.mInFlight.load(std::memory_order_acquire) == 0u)
+    {
+        return;
+    }
+    const auto       start = std::chrono::steady_clock::now();
+    bool             waited = false;
+    D3D12PipelineJob job;
+    if (d3d12ClaimOrAwaitPipeline(pPipeline, &job, &waited))
+    {
+        waited = true;
+        d3d12RunPipelineJob(pPipeline, job);
+    }
+    if (waited)
+    {
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
+        gPipelineQueue.mWaitedUs.fetch_add(static_cast<uint64_t>(us.count()), std::memory_order_relaxed);
+    }
+}
+
+extern "C" void d3d12GetPipelineProgress(uint32_t* pCompleted, uint32_t* pRequested)
+{
+    if (pCompleted)
+    {
+        *pCompleted = gPipelineQueue.mCompleted.load(std::memory_order_relaxed);
+    }
+    if (pRequested)
+    {
+        *pRequested = gPipelineQueue.mRequested.load(std::memory_order_relaxed);
+    }
+}
+
+extern "C" bool d3d12WaitForPipelines(uint32_t timeoutMs)
+{
+    if (gPipelineQueue.mInFlight.load(std::memory_order_acquire) == 0u)
+    {
+        return true;
+    }
+    std::unique_lock<std::mutex> lock(gPipelineQueue.mLock);
+    const auto                   done = [] { return gPipelineQueue.mInFlight.load(std::memory_order_acquire) == 0u; };
+    if (timeoutMs == UINT32_MAX)
+    {
+        gPipelineQueue.mFinished.wait(lock, done);
+        return true;
+    }
+    return gPipelineQueue.mFinished.wait_for(lock, std::chrono::milliseconds(timeoutMs), done);
+}
+
+extern "C" bool d3d12PipelineFailed(Pipeline* pPipeline)
+{
+    if (!pPipeline)
+    {
+        return true;
+    }
+    d3d12WaitForPipeline(pPipeline);
+    return pPipeline->mDx.mCreationFailed != 0u || pPipeline->mDx.pPipelineState == nullptr;
+}
+
+extern "C" bool d3d12PipelineReady(Pipeline* pPipeline)
+{
+    if (gPipelineQueue.mInFlight.load(std::memory_order_acquire) == 0u)
+    {
+        return true;
+    }
+    std::lock_guard<std::mutex> guard(gPipelineQueue.mLock);
+    return gPipelineQueue.mJobs.count(pPipeline) == 0u && gPipelineQueue.mRunning.count(pPipeline) == 0u;
+}
+
+extern "C" double d3d12TakePipelineWaitMs(void)
+{
+    return static_cast<double>(gPipelineQueue.mWaitedUs.exchange(0u, std::memory_order_relaxed)) / 1000.0;
+}
+
+extern "C" void d3d12ExitPipelineCreation(void)
+{
+    d3d12WaitForPipelines(UINT32_MAX);
+    std::vector<std::thread> workers;
+    {
+        std::lock_guard<std::mutex> guard(gPipelineQueue.mLock);
+        gPipelineQueue.mStopping = true;
+        workers.swap(gPipelineQueue.mWorkers);
+        gPipelineQueue.mQueued.notify_all();
+    }
+    for (std::thread& worker : workers)
+    {
+        worker.join();
+    }
+}
 #endif

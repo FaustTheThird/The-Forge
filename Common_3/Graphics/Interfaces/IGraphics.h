@@ -2138,6 +2138,8 @@ typedef struct DEFINE_ALIGNED(Pipeline, ALIGN_Pipeline)
         };
         PipelineType           mType;
         D3D_PRIMITIVE_TOPOLOGY mPrimitiveTopology;
+        // Set when the state was created on a worker and its creation failed (d3d12PipelineFailed).
+        uint32_t               mCreationFailed;
     } mDx;
 #endif
 #if defined(VULKAN)
@@ -2987,6 +2989,27 @@ bool mtlLoadPipelineArchive(Renderer* pRenderer, const char* pPath);
 void mtlGetPipelineProgress(uint32_t* pCompleted, uint32_t* pRequested);
 bool mtlWaitForPipelines(uint32_t timeoutMs);
 bool mtlPipelineFailed(Pipeline* pPipeline);
+// Whether pPipeline's state exists (or its creation failed) now, without waiting for it.
+bool mtlPipelineReady(Pipeline* pPipeline);
+// The milliseconds threads other than the workers spent waiting for a pipeline being created (a bind or a removal of
+// one not made yet), since the last call; the call resets it.
+double mtlTakePipelineWaitMs(void);
+#endif
+#if defined(DIRECT3D12)
+// Graphics, compute and mesh pipeline states are created on worker threads, several at a time: addPipeline returns a
+// pipeline before its state exists, and binding or removing a pipeline waits for that one (a thread that needs one no
+// worker has started creates it itself). A pipeline created through a pipeline library (PipelineDesc::pCache) or
+// with extensions is created at once, as before. d3d12GetPipelineProgress and d3d12WaitForPipelines let a caller wait
+// for all of them in steps, so it can report progress while the driver compiles; d3d12WaitForPipelines returns true
+// once none is in flight and false when timeoutMs ran out first (UINT32_MAX waits for as long as it takes).
+// d3d12PipelineFailed waits for one pipeline and answers whether its creation failed; a failed pipeline is not bound.
+// d3d12PipelineReady answers without waiting. d3d12TakePipelineWaitMs is the time threads other than the workers
+// spent waiting for a pipeline since the last call.
+void   d3d12GetPipelineProgress(uint32_t* pCompleted, uint32_t* pRequested);
+bool   d3d12WaitForPipelines(uint32_t timeoutMs);
+bool   d3d12PipelineFailed(Pipeline* pPipeline);
+bool   d3d12PipelineReady(Pipeline* pPipeline);
+double d3d12TakePipelineWaitMs(void);
 #endif
 
 // Descriptor Set functions

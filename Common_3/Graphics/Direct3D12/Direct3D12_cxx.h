@@ -91,6 +91,18 @@ typedef IDXGIAdapter4 D3D12MA_IDXGIAdapter;
         UINT                            nodeMask,
         ID3D12PipelineState**           ppOut);
 
+    // Pipeline states created on worker threads. A job creates one pipeline's state from data it owns and answers
+    // whether it succeeded; release frees that data once the job has run (or will never run). d3d12CreatePipelineAsync
+    // queues the job for pPipeline; d3d12WaitForPipeline returns once pPipeline's state exists or failed, running the
+    // job on the calling thread when no worker has started it; d3d12ExitPipelineCreation waits for every job and stops
+    // the workers.
+    typedef BOOL (*D3D12PipelineJobRun)(void* pJob);
+    typedef void (*D3D12PipelineJobRelease)(void* pJob);
+    extern void d3d12CreatePipelineAsync(struct Pipeline* pPipeline, void* pJob, D3D12PipelineJobRun run,
+                                         D3D12PipelineJobRelease release);
+    extern void d3d12WaitForPipeline(struct Pipeline* pPipeline);
+    extern void d3d12ExitPipelineCreation(void);
+
 #ifdef __cplusplus
 }
 #endif

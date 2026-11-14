@@ -2903,6 +2903,9 @@ void exitRenderer(Renderer* pRenderer)
     ASSERT(pRenderer);
     --gRendererCount;
 
+    // Every pipeline still being created finishes before the device goes, and the workers stop.
+    d3d12ExitPipelineCreation();
+
     remove_default_resources(pRenderer);
 
     // Destroy the Direct3D12 bits
@@ -4816,6 +4819,165 @@ void cmdBindDescriptorSet(Cmd* pCmd, uint32_t index, DescriptorSet* pDescriptorS
 /************************************************************************/
 // Pipeline State Functions
 /************************************************************************/
+
+// Pipeline states created on worker threads (Direct3D12_cxx.cpp). A job copies everything the device call reads, the
+// shaders' bytecode included, so it does not depend on the caller's descriptor or on the shader outliving the queue.
+
+// Copies the stages' bytecode into one block and points them at the copies.
+static uint8_t* d3d12CopyByteCode(D3D12_SHADER_BYTECODE** ppStages, uint32_t count)
+{
+    size_t total = 0;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        total += ppStages[i]->BytecodeLength;
+    }
+    uint8_t* pBlock = total ? (uint8_t*)tf_malloc(total) : NULL;
+    size_t   offset = 0;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        if (ppStages[i]->BytecodeLength == 0)
+        {
+            continue;
+        }
+        memcpy(pBlock + offset, ppStages[i]->pShaderBytecode, ppStages[i]->BytecodeLength);
+        ppStages[i]->pShaderBytecode = pBlock + offset;
+        offset += ppStages[i]->BytecodeLength;
+    }
+    return pBlock;
+}
+
+typedef struct D3D12GraphicsPipelineJob
+{
+    ID3D12Device*                      pDevice;
+    Pipeline*                          pPipeline;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC mDesc;
+    D3D12_INPUT_ELEMENT_DESC           mElements[MAX_VERTEX_ATTRIBS];
+    char                               mSemanticNames[MAX_VERTEX_ATTRIBS][MAX_SEMANTIC_NAME_LENGTH];
+    uint8_t*                           pByteCode;
+} D3D12GraphicsPipelineJob;
+
+static BOOL d3d12RunGraphicsPipelineJob(void* pData)
+{
+    D3D12GraphicsPipelineJob* pJob = (D3D12GraphicsPipelineJob*)pData;
+    HRESULT hr = hook_create_graphics_pipeline_state(pJob->pDevice, &pJob->mDesc, NULL, 0, &pJob->pPipeline->mDx.pPipelineState);
+    if (!SUCCEEDED(hr))
+    {
+        LOGF(eERROR, "D3D12: a graphics pipeline state could not be created (0x%08x)", (unsigned)hr);
+    }
+    return SUCCEEDED(hr);
+}
+
+static void d3d12ReleaseGraphicsPipelineJob(void* pData)
+{
+    D3D12GraphicsPipelineJob* pJob = (D3D12GraphicsPipelineJob*)pData;
+    tf_free(pJob->pByteCode);
+    tf_free(pJob);
+}
+
+static void d3d12QueueGraphicsPipeline(Renderer* pRenderer, Pipeline* pPipeline, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pDesc)
+{
+    D3D12GraphicsPipelineJob* pJob = (D3D12GraphicsPipelineJob*)tf_calloc(1, sizeof(D3D12GraphicsPipelineJob));
+    ASSERT(pJob);
+    pJob->pDevice = pRenderer->mDx.pDevice;
+    pJob->pPipeline = pPipeline;
+    pJob->mDesc = *pDesc;
+    const UINT elementCount = min(pDesc->InputLayout.NumElements, (UINT)MAX_VERTEX_ATTRIBS);
+    for (UINT i = 0; i < elementCount; ++i)
+    {
+        pJob->mElements[i] = pDesc->InputLayout.pInputElementDescs[i];
+        if (pJob->mElements[i].SemanticName)
+        {
+            strncpy(pJob->mSemanticNames[i], pJob->mElements[i].SemanticName, MAX_SEMANTIC_NAME_LENGTH - 1);
+            pJob->mElements[i].SemanticName = pJob->mSemanticNames[i];
+        }
+    }
+    pJob->mDesc.InputLayout.pInputElementDescs = elementCount ? pJob->mElements : NULL;
+    pJob->mDesc.InputLayout.NumElements = elementCount;
+    D3D12_SHADER_BYTECODE* stages[] = { &pJob->mDesc.VS, &pJob->mDesc.PS, &pJob->mDesc.DS, &pJob->mDesc.HS, &pJob->mDesc.GS };
+    pJob->pByteCode = d3d12CopyByteCode(stages, TF_ARRAY_COUNT(stages));
+    d3d12CreatePipelineAsync(pPipeline, pJob, d3d12RunGraphicsPipelineJob, d3d12ReleaseGraphicsPipelineJob);
+}
+
+typedef struct D3D12ComputePipelineJob
+{
+    ID3D12Device*                     pDevice;
+    Pipeline*                         pPipeline;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC mDesc;
+    uint8_t*                          pByteCode;
+} D3D12ComputePipelineJob;
+
+static BOOL d3d12RunComputePipelineJob(void* pData)
+{
+    D3D12ComputePipelineJob* pJob = (D3D12ComputePipelineJob*)pData;
+    HRESULT hr = hook_create_compute_pipeline_state(pJob->pDevice, &pJob->mDesc, NULL, 0, &pJob->pPipeline->mDx.pPipelineState);
+    if (!SUCCEEDED(hr))
+    {
+        LOGF(eERROR, "D3D12: a compute pipeline state could not be created (0x%08x)", (unsigned)hr);
+    }
+    return SUCCEEDED(hr);
+}
+
+static void d3d12ReleaseComputePipelineJob(void* pData)
+{
+    D3D12ComputePipelineJob* pJob = (D3D12ComputePipelineJob*)pData;
+    tf_free(pJob->pByteCode);
+    tf_free(pJob);
+}
+
+static void d3d12QueueComputePipeline(Renderer* pRenderer, Pipeline* pPipeline, const D3D12_COMPUTE_PIPELINE_STATE_DESC* pDesc)
+{
+    D3D12ComputePipelineJob* pJob = (D3D12ComputePipelineJob*)tf_calloc(1, sizeof(D3D12ComputePipelineJob));
+    ASSERT(pJob);
+    pJob->pDevice = pRenderer->mDx.pDevice;
+    pJob->pPipeline = pPipeline;
+    pJob->mDesc = *pDesc;
+    D3D12_SHADER_BYTECODE* stages[] = { &pJob->mDesc.CS };
+    pJob->pByteCode = d3d12CopyByteCode(stages, TF_ARRAY_COUNT(stages));
+    d3d12CreatePipelineAsync(pPipeline, pJob, d3d12RunComputePipelineJob, d3d12ReleaseComputePipelineJob);
+}
+
+typedef struct D3D12MeshPipelineJob
+{
+    ID3D12Device*            pDevice;
+    ID3D12RootSignature*     pRootSignature;
+    Pipeline*                pPipeline;
+    D3D12_SHADER_BYTECODE    mAS;
+    D3D12_SHADER_BYTECODE    mMS;
+    D3D12_SHADER_BYTECODE    mPS;
+    bool                     mHasAS;
+    bool                     mHasPS;
+    D3D12_BLEND_DESC         mBlend;
+    D3D12_RASTERIZER_DESC    mRasterizer;
+    D3D12_DEPTH_STENCIL_DESC mDepthStencil;
+    DXGI_FORMAT              mDsvFormat;
+    DXGI_FORMAT              mRtvFormats[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    UINT                     mRtvCount;
+    DXGI_SAMPLE_DESC         mSampleDesc;
+    UINT                     mNodeMask;
+    uint8_t*                 pByteCode;
+} D3D12MeshPipelineJob;
+
+static BOOL d3d12RunMeshPipelineJob(void* pData)
+{
+    D3D12MeshPipelineJob* pJob = (D3D12MeshPipelineJob*)pData;
+    HRESULT hr = Bloom_CreateMeshPipelineState(pJob->pDevice, pJob->pRootSignature, pJob->mHasAS ? &pJob->mAS : NULL, &pJob->mMS,
+                                               pJob->mHasPS ? &pJob->mPS : NULL, &pJob->mBlend, &pJob->mRasterizer,
+                                               &pJob->mDepthStencil, pJob->mDsvFormat, pJob->mRtvFormats, pJob->mRtvCount,
+                                               &pJob->mSampleDesc, UINT_MAX, pJob->mNodeMask, &pJob->pPipeline->mDx.pPipelineState);
+    if (!SUCCEEDED(hr))
+    {
+        LOGF(eERROR, "D3D12: a mesh pipeline state could not be created (0x%08x)", (unsigned)hr);
+    }
+    return SUCCEEDED(hr);
+}
+
+static void d3d12ReleaseMeshPipelineJob(void* pData)
+{
+    D3D12MeshPipelineJob* pJob = (D3D12MeshPipelineJob*)pData;
+    tf_free(pJob->pByteCode);
+    tf_free(pJob);
+}
+
 static void addGraphicsPipeline(Renderer* pRenderer, const PipelineDesc* pMainDesc, Pipeline** ppPipeline)
 {
     ASSERT(pRenderer);
@@ -5096,6 +5258,19 @@ static void addGraphicsPipeline(Renderer* pRenderer, const PipelineDesc* pMainDe
     }
 #endif
 
+    // A pipeline the library does not serve and that carries no extensions is created on a worker.
+    bool queued = false;
+#ifndef DISABLE_PIPELINE_LIBRARY
+    queued = !psoCache;
+#else
+    queued = true;
+#endif
+    if (!SUCCEEDED(result) && queued && pMainDesc->mExtensionCount == 0)
+    {
+        d3d12QueueGraphicsPipeline(pRenderer, pPipeline, &pipeline_state_desc);
+        result = S_OK;
+    }
+
     if (!SUCCEEDED(result))
     {
         CHECK_HRESULT(hook_create_graphics_pipeline_state(pRenderer->mDx.pDevice, &pipeline_state_desc, pMainDesc->pPipelineExtensions,
@@ -5197,6 +5372,19 @@ static void addComputePipeline(Renderer* pRenderer, const PipelineDesc* pMainDes
     }
 #endif
 
+    // A pipeline the library does not serve and that carries no extensions is created on a worker.
+    bool queued = false;
+#ifndef DISABLE_PIPELINE_LIBRARY
+    queued = !psoCache;
+#else
+    queued = true;
+#endif
+    if (!SUCCEEDED(result) && queued && pMainDesc->mExtensionCount == 0)
+    {
+        d3d12QueueComputePipeline(pRenderer, pPipeline, &pipeline_state_desc);
+        result = S_OK;
+    }
+
     if (!SUCCEEDED(result))
     {
         CHECK_HRESULT(hook_create_compute_pipeline_state(pRenderer->mDx.pDevice, &pipeline_state_desc, pMainDesc->pPipelineExtensions,
@@ -5292,23 +5480,31 @@ static void addMeshPipeline(Renderer* pRenderer, const PipelineDesc* pMainDesc, 
     // (manifesting as "Duplicate Subobject Type: ROOT_SIGNATURE" the
     // first time the runtime hits a zero 4B slot). The C++ shim uses
     // alignas-on-class + standard template wrappers and gets it right.
-    HRESULT hr = Bloom_CreateMeshPipelineState(
-        pRenderer->mDx.pDevice,
-        pRenderer->mDx.pGraphicsRootSignature,
-        (pShaderProgram->mStages & SHADER_STAGE_TASK) ? &AS : NULL,
-        &MS,
-        (pShaderProgram->mStages & SHADER_STAGE_FRAG) ? &PS : NULL,
-        &blend_desc,
-        &rast_desc,
-        &ds_desc,
-        dsv_format,
-        rt_formats.RTFormats,
-        rt_formats.NumRenderTargets,
-        &sample_desc,
-        UINT_MAX,
-        util_calculate_shared_node_mask(pRenderer),
-        &pPipeline->mDx.pPipelineState);
-    CHECK_HRESULT(hr);
+    // Created on a worker like the graphics and compute pipelines; the job keeps copies of every input.
+    D3D12MeshPipelineJob* pJob = (D3D12MeshPipelineJob*)tf_calloc(1, sizeof(D3D12MeshPipelineJob));
+    ASSERT(pJob);
+    pJob->pDevice = pRenderer->mDx.pDevice;
+    pJob->pRootSignature = pRenderer->mDx.pGraphicsRootSignature;
+    pJob->pPipeline = pPipeline;
+    pJob->mHasAS = (pShaderProgram->mStages & SHADER_STAGE_TASK) != 0;
+    pJob->mHasPS = (pShaderProgram->mStages & SHADER_STAGE_FRAG) != 0;
+    pJob->mAS = AS;
+    pJob->mMS = MS;
+    pJob->mPS = PS;
+    pJob->mBlend = blend_desc;
+    pJob->mRasterizer = rast_desc;
+    pJob->mDepthStencil = ds_desc;
+    pJob->mDsvFormat = dsv_format;
+    pJob->mRtvCount = rt_formats.NumRenderTargets;
+    for (UINT i = 0; i < rt_formats.NumRenderTargets; ++i)
+    {
+        pJob->mRtvFormats[i] = rt_formats.RTFormats[i];
+    }
+    pJob->mSampleDesc = sample_desc;
+    pJob->mNodeMask = util_calculate_shared_node_mask(pRenderer);
+    D3D12_SHADER_BYTECODE* stages[] = { &pJob->mAS, &pJob->mMS, &pJob->mPS };
+    pJob->pByteCode = d3d12CopyByteCode(stages, TF_ARRAY_COUNT(stages));
+    d3d12CreatePipelineAsync(pPipeline, pJob, d3d12RunMeshPipelineJob, d3d12ReleaseMeshPipelineJob);
 
     *ppPipeline = pPipeline;
 }
@@ -5352,6 +5548,8 @@ void removePipeline(Renderer* pRenderer, Pipeline* pPipeline)
 {
     ASSERT(pRenderer);
     ASSERT(pPipeline);
+    // A worker may still be creating its state.
+    d3d12WaitForPipeline(pPipeline);
 
     // delete pipeline from device
     hook_remove_pipeline(pPipeline);
@@ -5689,6 +5887,19 @@ void cmdBindPipeline(Cmd* pCmd, Pipeline* pPipeline)
 {
     ASSERT(pCmd);
     ASSERT(pPipeline);
+
+    // The state may still be being created on a worker: wait for this one (or create it here when no worker has
+    // started it). A pipeline whose creation failed has no state to bind.
+    d3d12WaitForPipeline(pPipeline);
+    bool hasState = pPipeline->mDx.pPipelineState != NULL;
+#if defined(ENABLE_WORKGRAPH)
+    hasState = hasState || pPipeline->mDx.mType == PIPELINE_TYPE_WORKGRAPH;
+#endif
+    if (!hasState)
+    {
+        LOGF(eERROR, "cmdBindPipeline: the pipeline has no state (its creation failed); it is not bound");
+        return;
+    }
 
     // bind given pipeline
     ASSERT(pCmd->mDx.pCmdList);

@@ -51,6 +51,7 @@
 // Fallback if os_proc_available_memory not available
 #include <mach/mach.h>
 #include <mach/mach_host.h>
+#include <mach/mach_time.h>
 #include <sys/sysctl.h>
 
 #include "../../Resources/ResourceLoader/ThirdParty/OpenSource/tinyimageformat/tinyimageformat_apis.h"
@@ -110,6 +111,8 @@ static NSMutableSet<NSValue*>* gPipelinesRunning = nil;
 static uint32_t gPipelinesRequested = 0;
 static uint32_t gPipelinesCompleted = 0;
 static uint32_t gPipelinesInFlight = 0;
+// Microseconds threads other than the workers spent waiting for a pipeline being created (mtlTakePipelineWaitMs).
+static uint64_t gPipelineWaitUs = 0;
 
 // A large ray-tracing kernel takes the GPU compiler gigabytes of memory, so the number compiled at once is bounded by
 // the machine's memory as well as by its performance cores: running more than fit would page instead of compiling.
@@ -206,14 +209,29 @@ static void mtlWaitForPipeline(Pipeline* pPipeline)
     {
         return;
     }
+    const uint64_t start = mach_absolute_time();
+    NSValue*       key = [NSValue valueWithPointer:pPipeline];
+    [gPipelineCondition lock];
+    const bool pending = gPipelineCreations[key] != nil || [gPipelinesRunning containsObject:key];
+    [gPipelineCondition unlock];
+    if (!pending)
+    {
+        return;
+    }
     mtlRunPipelineCreation(pPipeline);
-    NSValue* key = [NSValue valueWithPointer:pPipeline];
     [gPipelineCondition lock];
     while ([gPipelinesRunning containsObject:key])
     {
         [gPipelineCondition wait];
     }
     [gPipelineCondition unlock];
+    static mach_timebase_info_data_t timebase = { 0, 0 };
+    if (timebase.denom == 0)
+    {
+        mach_timebase_info(&timebase);
+    }
+    const uint64_t ns = (mach_absolute_time() - start) * timebase.numer / timebase.denom;
+    __atomic_fetch_add(&gPipelineWaitUs, ns / 1000u, __ATOMIC_RELAXED);
 }
 
 void mtlGetPipelineProgress(uint32_t* pCompleted, uint32_t* pRequested)
@@ -250,6 +268,24 @@ bool mtlWaitForPipelines(uint32_t timeoutMs)
     const bool done = __atomic_load_n(&gPipelinesInFlight, __ATOMIC_ACQUIRE) == 0;
     [gPipelineCondition unlock];
     return done;
+}
+
+bool mtlPipelineReady(Pipeline* pPipeline)
+{
+    if (__atomic_load_n(&gPipelinesInFlight, __ATOMIC_ACQUIRE) == 0)
+    {
+        return true;
+    }
+    NSValue* key = [NSValue valueWithPointer:pPipeline];
+    [gPipelineCondition lock];
+    const bool pending = gPipelineCreations[key] != nil || [gPipelinesRunning containsObject:key];
+    [gPipelineCondition unlock];
+    return !pending;
+}
+
+double mtlTakePipelineWaitMs(void)
+{
+    return (double)__atomic_exchange_n(&gPipelineWaitUs, 0u, __ATOMIC_RELAXED) / 1000.0;
 }
 
 bool mtlPipelineFailed(Pipeline* pPipeline)
