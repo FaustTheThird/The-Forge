@@ -4408,18 +4408,26 @@ void mtlCmdSampleBoundary(Cmd* pCmd)
         }
         QuerySampleDesc* pSample = &((QuerySampleDesc*)pCmd->pCurrentQueryPool->pQueries)[pCmd->mCurrentQueryIndex];
         pSample->mSpan = true;
-        MTLComputePassDescriptor* computePassDescriptor = [MTLComputePassDescriptor computePassDescriptor];
-        MTLComputePassSampleBufferAttachmentDescriptor* sampleAttachmentDesc = computePassDescriptor.sampleBufferAttachments[0];
+        // A blit pass that fills four bytes: an encoder with no work may be skipped by the GPU and leave its samples
+        // unwritten, so the mark carries the smallest work there is.
+        static id<MTLBuffer> markTarget = nil;
+        if (markTarget == nil)
+        {
+            markTarget = [pCmd->pRenderer->pDevice newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+        }
+        MTLBlitPassDescriptor* blitPassDescriptor = [MTLBlitPassDescriptor blitPassDescriptor];
+        MTLBlitPassSampleBufferAttachmentDescriptor* sampleAttachmentDesc = blitPassDescriptor.sampleBufferAttachments[0];
         sampleAttachmentDesc.sampleBuffer = pCmd->pCurrentQueryPool->pSampleBuffer;
         sampleAttachmentDesc.startOfEncoderSampleIndex = sampleStartIndex;
         sampleAttachmentDesc.endOfEncoderSampleIndex = sampleStartIndex + 1;
         // The mark waits on and signals the queue fence like any other encoder, so it sits between the work before and
         // after it on the GPU's timeline.
-        pCmd->pComputeEncoder = [pCmd->pCommandBuffer computeCommandEncoderWithDescriptor:computePassDescriptor];
+        pCmd->pBlitEncoder = [pCmd->pCommandBuffer blitCommandEncoderWithDescriptor:blitPassDescriptor];
         if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_FENCE)
         {
-            [pCmd->pComputeEncoder waitForFence:pCmd->pQueue->pQueueFence];
+            [pCmd->pBlitEncoder waitForFence:pCmd->pQueue->pQueueFence];
         }
+        [pCmd->pBlitEncoder fillBuffer:markTarget range:NSMakeRange(0, 4) value:0];
         util_end_current_encoders(pCmd, true);
     }
 }
