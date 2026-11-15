@@ -336,6 +336,8 @@ typedef struct QuerySampleDesc
         };
         bool mHasBeginSample;
     };
+    // The query measures from its first encoder's start to its last encoder's end (mtlCmdSampleBoundary).
+    bool mSpan;
 } QuerySampleDesc;
 
 // MAX: 4
@@ -4389,6 +4391,39 @@ void endCmd(Cmd* pCmd)
     }
 }
 
+void mtlCmdSampleBoundary(Cmd* pCmd)
+{
+    ASSERT(pCmd);
+    if (pCmd->pCurrentQueryPool == nil || pCmd->mCurrentQueryIndex < 0 || !pCmd->pRenderer->pGpu->mStageBoundarySamplingSupported)
+    {
+        return;
+    }
+    @autoreleasepool
+    {
+        util_end_current_encoders(pCmd, true);
+        uint32_t sampleStartIndex = 0;
+        if (!util_reserve_encoder_sample(pCmd, false, &sampleStartIndex))
+        {
+            return;
+        }
+        QuerySampleDesc* pSample = &((QuerySampleDesc*)pCmd->pCurrentQueryPool->pQueries)[pCmd->mCurrentQueryIndex];
+        pSample->mSpan = true;
+        MTLComputePassDescriptor* computePassDescriptor = [MTLComputePassDescriptor computePassDescriptor];
+        MTLComputePassSampleBufferAttachmentDescriptor* sampleAttachmentDesc = computePassDescriptor.sampleBufferAttachments[0];
+        sampleAttachmentDesc.sampleBuffer = pCmd->pCurrentQueryPool->pSampleBuffer;
+        sampleAttachmentDesc.startOfEncoderSampleIndex = sampleStartIndex;
+        sampleAttachmentDesc.endOfEncoderSampleIndex = sampleStartIndex + 1;
+        // The mark waits on and signals the queue fence like any other encoder, so it sits between the work before and
+        // after it on the GPU's timeline.
+        pCmd->pComputeEncoder = [pCmd->pCommandBuffer computeCommandEncoderWithDescriptor:computePassDescriptor];
+        if (pCmd->pQueue->mBarrierFlags & BARRIER_FLAG_FENCE)
+        {
+            [pCmd->pComputeEncoder waitForFence:pCmd->pQueue->pQueueFence];
+        }
+        util_end_current_encoders(pCmd, true);
+    }
+}
+
 void* mtlCmdSuspendEncoding(Cmd* pCmd)
 {
     ASSERT(pCmd);
@@ -5957,6 +5992,7 @@ void cmdBeginQuery(Cmd* pCmd, QueryPool* pQueryPool, QueryDesc* pQuery)
             pSample->mComputeSamples = 0;
             pSample->mRenderStartIndex = pQueryPool->mRenderSamplesOffset;
             pSample->mComputeStartIndex = pQueryPool->mComputeSamplesOffset;
+            pSample->mSpan = false;
         }
         else if (pCmd->pRenderer->pGpu->mDrawBoundarySamplingSupported)
         {
@@ -6048,6 +6084,9 @@ void getQueryData(Renderer* pRenderer, QueryPool* pQueryPool, uint32_t queryInde
             // encoders, so per-pass times always fit inside the frame they came from.
             EncoderWindow windows[MaxEncoderWindows];
             uint32_t      windowCount = 0;
+            // For a span query: the first start and the last end of every encoder it opened, empty marks included.
+            MTLTimestamp spanFirst = ~0ull;
+            MTLTimestamp spanLast = 0;
 
             uint32_t numSamples = pSample->mRenderSamples;
             uint32_t startSampleIndex = pSample->mRenderStartIndex;
@@ -6081,6 +6120,8 @@ void getQueryData(Renderer* pRenderer, QueryPool* pQueryPool, uint32_t queryInde
                     // The encoder was busy from whichever stage started first to whichever finished last.
                     util_add_encoder_window(windows, &windowCount, min(sVertTime, sFragTime), max(eVertTime, eFragTime),
                                             &sumEncoderTimestamps);
+                    spanFirst = min(spanFirst, min(sVertTime, sFragTime));
+                    spanLast = max(spanLast, max(eVertTime, eFragTime));
                 }
             }
 
@@ -6108,10 +6149,19 @@ void getQueryData(Renderer* pRenderer, QueryPool* pQueryPool, uint32_t queryInde
                     }
 
                     util_add_encoder_window(windows, &windowCount, startTimestamp, endTimestamp, &sumEncoderTimestamps);
+                    spanFirst = min(spanFirst, startTimestamp);
+                    spanLast = max(spanLast, endTimestamp);
                 }
             }
 
-            sumEncoderTimestamps += util_union_encoder_windows(windows, windowCount);
+            if (pSample->mSpan && spanLast > spanFirst)
+            {
+                sumEncoderTimestamps = spanLast - spanFirst;
+            }
+            else
+            {
+                sumEncoderTimestamps += util_union_encoder_windows(windows, windowCount);
+            }
             // Spans start one tick past zero for the same reason as the frame scope above: a zero begin reads as
             // an unwritten query. A pass that opened no encoder is a measured zero, [1, 1].
             pOutData->mBeginTimestamp = 1;

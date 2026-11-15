@@ -3028,6 +3028,10 @@ void endCmd(Cmd* pCmd);
 // framework must be told to wait on and signal. Nothing in Metal orders work across an encoder boundary by
 // itself, so skipping either half of the handshake lets the framework and the renderer run concurrently.
 void* mtlCmdSuspendEncoding(Cmd* pCmd);
+// Marks a point of the open timestamp query with an empty sampled encoder, and turns the query into a span: it then
+// measures from the first encoder it opened to the last instead of their union. A query bracketing work encoded by a
+// framework (whose encoders carry no sample attachment) brackets that work with two marks and so measures it.
+void mtlCmdSampleBoundary(Cmd* pCmd);
 #endif
 void cmdBindRenderTargets(Cmd* pCmd, const BindRenderTargetsDesc* pDesc);
 void cmdSetViewport(Cmd* pCmd, float x, float y, float width, float height, float minDepth, float maxDepth);
