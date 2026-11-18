@@ -88,10 +88,18 @@ typedef struct Raytracing
     D3D12_RAYTRACING_TIER mTier;
 } Raytracing;
 
+typedef struct AccelerationStructurePage
+{
+    Buffer* pBuffer;
+} AccelerationStructurePage;
+
 typedef struct AccelerationStructure
 {
-    Buffer* pASBuffer;
-    Buffer* pScratchBuffer;
+    // The structure's own storage, or null for a placed structure, which lives at mAddress in pPageBuffer.
+    Buffer*                   pASBuffer;
+    Buffer*                   pScratchBuffer;
+    Buffer*                   pPageBuffer;
+    D3D12_GPU_VIRTUAL_ADDRESS mAddress;
     union
     {
         struct
@@ -153,13 +161,8 @@ static inline FORGE_CONSTEXPR D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE ToDXR
 
 extern void AddSrv(Renderer*, struct DescriptorHeap*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, DxDescriptorID*);
 
-void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructureDesc* pDesc,
-                              AccelerationStructure** ppAccelerationStructure)
+static AccelerationStructure* allocAccelerationStructure(const AccelerationStructureDesc* pDesc)
 {
-    ASSERT(pRaytracing);
-    ASSERT(pDesc);
-    ASSERT(ppAccelerationStructure);
-
     size_t memSize = sizeof(AccelerationStructure);
     if (ACCELERATION_STRUCTURE_TYPE_BOTTOM == pDesc->mType)
     {
@@ -171,10 +174,14 @@ void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructu
 
     pAS->mFlags = util_to_dx_acceleration_structure_build_flags(pDesc->mFlags);
     pAS->mType = ToDXRASType(pDesc->mType);
+    return pAS;
+}
 
-    uint32_t scratchBufferSize = 0;
-
-    if (ACCELERATION_STRUCTURE_TYPE_BOTTOM == pDesc->mType)
+// Fills the bottom-level structure's geometry from pDesc and asks the device what building it takes.
+static void prepareBottomAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructureDesc* pDesc,
+                                               AccelerationStructure* pAS,
+                                               D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo)
+{
     {
         pAS->mDescCount = pDesc->mBottom.mDescCount;
         pAS->pGeometryDescs = (D3D12_RAYTRACING_GEOMETRY_DESC*)(pAS + 1); //-V1027
@@ -242,8 +249,25 @@ void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructu
             .pGeometryDescs = pAS->pGeometryDescs,
             .Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
         };
+        hook_GetRaytracingAccelerationStructurePrebuildInfo(pRaytracing->prDevice, &prebuildDesc, pInfo);
+    }
+}
+
+void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructureDesc* pDesc,
+                              AccelerationStructure** ppAccelerationStructure)
+{
+    ASSERT(pRaytracing);
+    ASSERT(pDesc);
+    ASSERT(ppAccelerationStructure);
+
+    AccelerationStructure* pAS = allocAccelerationStructure(pDesc);
+
+    uint32_t scratchBufferSize = 0;
+
+    if (ACCELERATION_STRUCTURE_TYPE_BOTTOM == pDesc->mType)
+    {
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = { 0 };
-        hook_GetRaytracingAccelerationStructurePrebuildInfo(pRaytracing->prDevice, &prebuildDesc, &info);
+        prepareBottomAccelerationStructure(pRaytracing, pDesc, pAS, &info);
 
         /************************************************************************/
         // Allocate Acceleration Structure Buffer
@@ -259,6 +283,7 @@ void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructu
             .mStartState = RESOURCE_STATE_ACCELERATION_STRUCTURE_WRITE,
         };
         addBuffer(pRaytracing->pRenderer, &bufferDesc, &pAS->pASBuffer);
+        pAS->mAddress = pAS->pASBuffer->mDx.mGpuAddress;
         /************************************************************************/
         // Store the scratch buffer size so user can create the scratch buffer accordingly
         /************************************************************************/
@@ -291,9 +316,8 @@ void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructu
             AccelerationStructureInstanceDesc* pInst = &pDesc->mTop.pInstanceDescs[i];
             ASSERT(pInst->pBottomAS);
 
-            const Buffer* pASBuffer = pInst->pBottomAS->pASBuffer;
             instanceDescs[i] = (D3D12_RAYTRACING_INSTANCE_DESC){
-                .AccelerationStructure = COM_CALL(GetGPUVirtualAddress, pASBuffer->mDx.pResource),
+                .AccelerationStructure = pInst->pBottomAS->mAddress,
                 .Flags = util_to_dx_instance_flags(pInst->mFlags),
                 .InstanceContributionToHitGroupIndex = pInst->mInstanceContributionToHitGroupIndex,
                 .InstanceID = pInst->mInstanceID,
@@ -328,6 +352,7 @@ void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructu
             .mStartState = RESOURCE_STATE_ACCELERATION_STRUCTURE_WRITE,
         };
         addBuffer(pRaytracing->pRenderer, &bufferDesc, &pAS->pASBuffer);
+        pAS->mAddress = pAS->pASBuffer->mDx.mGpuAddress;
 
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
             .ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
@@ -354,12 +379,90 @@ void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructu
     *ppAccelerationStructure = pAS;
 }
 
+bool isAccelerationStructurePlacementSupported(Raytracing* pRaytracing)
+{
+    UNREF_PARAM(pRaytracing);
+    return true;
+}
+
+uint64_t getAccelerationStructurePlacementAlignment(Raytracing* pRaytracing)
+{
+    UNREF_PARAM(pRaytracing);
+    // Both a structure's address and its build scratch's address must be multiples of this.
+    return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
+}
+
+void addAccelerationStructurePage(Raytracing* pRaytracing, uint64_t size, AccelerationStructurePage** ppPage)
+{
+    ASSERT(pRaytracing);
+    ASSERT(ppPage);
+    AccelerationStructurePage* pPage = (AccelerationStructurePage*)tf_calloc(1, sizeof(AccelerationStructurePage));
+    ASSERT(pPage);
+    // A placed structure is written by its build and read by the top-level build and the ray queries, so the page
+    // stays in the acceleration-structure state its whole life, as a structure's own buffer does.
+    BufferDesc bufferDesc = {
+        .mDescriptors = DESCRIPTOR_TYPE_RW_BUFFER,
+        .mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY,
+        .mFlags = BUFFER_CREATION_FLAG_OWN_MEMORY_BIT | BUFFER_CREATION_FLAG_NO_DESCRIPTOR_VIEW_CREATION,
+        .mStructStride = 0,
+        .mFirstElement = 0,
+        .mElementCount = (uint32_t)(size / sizeof(UINT32)),
+        .mSize = size,
+        .mStartState = RESOURCE_STATE_ACCELERATION_STRUCTURE_WRITE,
+        .pName = "AccelerationStructurePage",
+    };
+    addBuffer(pRaytracing->pRenderer, &bufferDesc, &pPage->pBuffer);
+    *ppPage = pPage;
+}
+
+void removeAccelerationStructurePage(Raytracing* pRaytracing, AccelerationStructurePage* pPage)
+{
+    ASSERT(pRaytracing);
+    if (!pPage)
+    {
+        return;
+    }
+    removeBuffer(pRaytracing->pRenderer, pPage->pBuffer);
+    tf_free(pPage);
+}
+
+void addPlacedAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructureDesc* pDesc,
+                                    AccelerationStructureSizes* pOutSizes, AccelerationStructure** ppAccelerationStructure)
+{
+    ASSERT(pRaytracing);
+    ASSERT(pDesc);
+    ASSERT(pOutSizes);
+    ASSERT(ppAccelerationStructure);
+    ASSERT(ACCELERATION_STRUCTURE_TYPE_BOTTOM == pDesc->mType);
+
+    AccelerationStructure* pAS = allocAccelerationStructure(pDesc);
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = { 0 };
+    prepareBottomAccelerationStructure(pRaytracing, pDesc, pAS, &info);
+    pOutSizes->mResultSize = info.ResultDataMaxSizeInBytes;
+    pOutSizes->mScratchSize = info.ScratchDataSizeInBytes;
+    *ppAccelerationStructure = pAS;
+}
+
+void placeAccelerationStructure(Raytracing* pRaytracing, AccelerationStructure* pAccelerationStructure,
+                                AccelerationStructurePage* pPage, uint64_t offset)
+{
+    UNREF_PARAM(pRaytracing);
+    ASSERT(pAccelerationStructure);
+    ASSERT(pPage);
+    ASSERT((offset % D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT) == 0);
+    pAccelerationStructure->pPageBuffer = pPage->pBuffer;
+    pAccelerationStructure->mAddress = pPage->pBuffer->mDx.mGpuAddress + offset;
+}
+
 void removeAccelerationStructure(Raytracing* pRaytracing, AccelerationStructure* pAccelerationStructure)
 {
     ASSERT(pRaytracing);
     ASSERT(pAccelerationStructure);
 
-    removeBuffer(pRaytracing->pRenderer, pAccelerationStructure->pASBuffer);
+    if (pAccelerationStructure->pASBuffer)
+    {
+        removeBuffer(pRaytracing->pRenderer, pAccelerationStructure->pASBuffer);
+    }
     if (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL == pAccelerationStructure->mType)
     {
         removeBuffer(pRaytracing->pRenderer, pAccelerationStructure->pInstanceDescBuffer);
@@ -398,9 +501,20 @@ void cmdBuildAccelerationStructure(Cmd* pCmd, Raytracing* pRaytracing, Raytracin
     AccelerationStructure*                             as = pDesc->pAccelerationStructure;
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE type = as->mType;
 
+    // A placed structure builds in the scratch range the caller gives; a structure with its own scratch in that.
+    D3D12_GPU_VIRTUAL_ADDRESS scratch = 0;
+    if (as->pScratchBuffer)
+    {
+        scratch = COM_CALL(GetGPUVirtualAddress, as->pScratchBuffer->mDx.pResource);
+    }
+    else
+    {
+        ASSERT(pDesc->pScratchBuffer);
+        scratch = pDesc->pScratchBuffer->mDx.mGpuAddress + pDesc->mScratchOffset;
+    }
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc = {
-        .DestAccelerationStructureData = COM_CALL(GetGPUVirtualAddress, as->pASBuffer->mDx.pResource),
-        .ScratchAccelerationStructureData = COM_CALL(GetGPUVirtualAddress, as->pScratchBuffer->mDx.pResource),
+        .DestAccelerationStructureData = as->mAddress,
+        .ScratchAccelerationStructureData = scratch,
         .Inputs =
             (D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS){
                 .DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY,
@@ -422,7 +536,8 @@ void cmdBuildAccelerationStructure(Cmd* pCmd, Raytracing* pRaytracing, Raytracin
 
     if (pDesc->mIssueRWBarrier)
     {
-        BufferBarrier barrier = { as->pASBuffer, RESOURCE_STATE_ACCELERATION_STRUCTURE_WRITE, RESOURCE_STATE_ACCELERATION_STRUCTURE_READ };
+        BufferBarrier barrier = { as->pASBuffer ? as->pASBuffer : as->pPageBuffer, RESOURCE_STATE_ACCELERATION_STRUCTURE_WRITE,
+                                  RESOURCE_STATE_ACCELERATION_STRUCTURE_READ };
         cmdResourceBarrier(pCmd, 1, &barrier, 0, NULL, 0, NULL);
     }
 
@@ -519,6 +634,49 @@ void cmdBuildAccelerationStructure(Cmd* pCmd, Raytracing* pRaytracing, Raytracin
     UNREF_PARAM(pCmd);
     UNREF_PARAM(pRaytracing);
     UNREF_PARAM(pDesc);
+}
+
+bool isAccelerationStructurePlacementSupported(Raytracing* pRaytracing)
+{
+    UNREF_PARAM(pRaytracing);
+    return false;
+}
+
+uint64_t getAccelerationStructurePlacementAlignment(Raytracing* pRaytracing)
+{
+    UNREF_PARAM(pRaytracing);
+    return 1;
+}
+
+void addAccelerationStructurePage(Raytracing* pRaytracing, uint64_t size, AccelerationStructurePage** ppPage)
+{
+    UNREF_PARAM(pRaytracing);
+    UNREF_PARAM(size);
+    *ppPage = NULL;
+}
+
+void removeAccelerationStructurePage(Raytracing* pRaytracing, AccelerationStructurePage* pPage)
+{
+    UNREF_PARAM(pRaytracing);
+    UNREF_PARAM(pPage);
+}
+
+void addPlacedAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructureDesc* pDesc,
+                                    AccelerationStructureSizes* pOutSizes, AccelerationStructure** ppAccelerationStructure)
+{
+    UNREF_PARAM(pRaytracing);
+    UNREF_PARAM(pDesc);
+    UNREF_PARAM(pOutSizes);
+    *ppAccelerationStructure = NULL;
+}
+
+void placeAccelerationStructure(Raytracing* pRaytracing, AccelerationStructure* pAccelerationStructure,
+                                AccelerationStructurePage* pPage, uint64_t offset)
+{
+    UNREF_PARAM(pRaytracing);
+    UNREF_PARAM(pAccelerationStructure);
+    UNREF_PARAM(pPage);
+    UNREF_PARAM(offset);
 }
 
 #endif

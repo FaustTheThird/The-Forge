@@ -142,7 +142,23 @@ typedef struct RaytracingBuildASDesc
 {
     AccelerationStructure* pAccelerationStructure;
     bool                   mIssueRWBarrier;
+    // The build's scratch memory when the structure has none of its own (a placed structure): mScratchOffset bytes
+    // into pScratchBuffer, aligned to getAccelerationStructurePlacementAlignment. Ignored for a structure that owns
+    // its scratch.
+    Buffer*                pScratchBuffer;
+    uint64_t               mScratchOffset;
 } RaytracingBuildASDesc;
+
+// A large allocation bottom-level acceleration structures are placed in (a buffer in the acceleration-structure
+// state on Direct3D 12), so a structure needs no device allocation of its own.
+typedef struct AccelerationStructurePage AccelerationStructurePage;
+
+// What a placed structure needs: the bytes it takes in its page and the scratch bytes its build needs.
+typedef struct AccelerationStructureSizes
+{
+    uint64_t mResultSize;
+    uint64_t mScratchSize;
+} AccelerationStructureSizes;
 
 #ifdef __cplusplus
 extern "C"
@@ -161,6 +177,23 @@ extern "C"
     void removeAccelerationStructureScratch(Raytracing* pRaytracing, AccelerationStructure* pAccelerationStructure);
 
     void cmdBuildAccelerationStructure(Cmd* pCmd, Raytracing* pRaytracing, RaytracingBuildASDesc* pDesc);
+
+    // Placed bottom-level structures. A backend that cannot place them answers false and the functions below must not
+    // be called on it.
+    bool     isAccelerationStructurePlacementSupported(Raytracing* pRaytracing);
+    // The alignment of a structure's offset in its page and of a build's scratch offset.
+    uint64_t getAccelerationStructurePlacementAlignment(Raytracing* pRaytracing);
+    void     addAccelerationStructurePage(Raytracing* pRaytracing, uint64_t size, AccelerationStructurePage** ppPage);
+    // The page must hold no structure a queued or executing command list still uses.
+    void     removeAccelerationStructurePage(Raytracing* pRaytracing, AccelerationStructurePage* pPage);
+    // A bottom-level structure whose storage the caller provides: its geometry is taken from pDesc and its sizes are
+    // returned, nothing is allocated. It is placed with placeAccelerationStructure before its build is recorded, built
+    // with a scratch range in RaytracingBuildASDesc, and removed with removeAccelerationStructure, which frees nothing
+    // of its page.
+    void     addPlacedAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructureDesc* pDesc,
+                                            AccelerationStructureSizes* pOutSizes, AccelerationStructure** ppAccelerationStructure);
+    void     placeAccelerationStructure(Raytracing* pRaytracing, AccelerationStructure* pAccelerationStructure,
+                                        AccelerationStructurePage* pPage, uint64_t offset);
 
 #ifdef METAL
     void addSSVGFDenoiser(Renderer* pRenderer, SSVGFDenoiser** ppDenoiser);

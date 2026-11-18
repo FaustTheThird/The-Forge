@@ -539,6 +539,52 @@ void getMTLAccelerationStructureBottomReferences(AccelerationStructure* pAcceler
     *pOutReferences = pAccelerationStructure->pBottomASReferences;
 }
 
+// Placed structures are not offered on Metal yet: placing them needs an MTLHeap of the placement type whose structures
+// every encoder that traces declares resident with the heaps the backend already declares, and the alignment of each
+// structure from heapAccelerationStructureSizeAndAlignWithSize. Until then every structure keeps its own allocation.
+bool isAccelerationStructurePlacementSupported(Raytracing* pRaytracing)
+{
+    UNREF_PARAM(pRaytracing);
+    return false;
+}
+
+uint64_t getAccelerationStructurePlacementAlignment(Raytracing* pRaytracing)
+{
+    UNREF_PARAM(pRaytracing);
+    return 1;
+}
+
+void addAccelerationStructurePage(Raytracing* pRaytracing, uint64_t size, AccelerationStructurePage** ppPage)
+{
+    UNREF_PARAM(pRaytracing);
+    UNREF_PARAM(size);
+    *ppPage = NULL;
+}
+
+void removeAccelerationStructurePage(Raytracing* pRaytracing, AccelerationStructurePage* pPage)
+{
+    UNREF_PARAM(pRaytracing);
+    UNREF_PARAM(pPage);
+}
+
+void addPlacedAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructureDesc* pDesc,
+                                    AccelerationStructureSizes* pOutSizes, AccelerationStructure** ppAccelerationStructure)
+{
+    UNREF_PARAM(pRaytracing);
+    UNREF_PARAM(pDesc);
+    UNREF_PARAM(pOutSizes);
+    *ppAccelerationStructure = NULL;
+}
+
+void placeAccelerationStructure(Raytracing* pRaytracing, AccelerationStructure* pAccelerationStructure,
+                                AccelerationStructurePage* pPage, uint64_t offset)
+{
+    UNREF_PARAM(pRaytracing);
+    UNREF_PARAM(pAccelerationStructure);
+    UNREF_PARAM(pPage);
+    UNREF_PARAM(offset);
+}
+
 struct SSVGFDenoiser
 {
     id pDenoiser; // MPSSVGFDenoiser*
