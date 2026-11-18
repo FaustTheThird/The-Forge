@@ -153,11 +153,13 @@ typedef struct RaytracingBuildASDesc
 // state on Direct3D 12), so a structure needs no device allocation of its own.
 typedef struct AccelerationStructurePage AccelerationStructurePage;
 
-// What a placed structure needs: the bytes it takes in its page and the scratch bytes its build needs.
+// What a placed structure needs: the bytes it takes in its page, the alignment of its offset there (a multiple of
+// getAccelerationStructurePlacementAlignment) and the scratch bytes its build needs.
 typedef struct AccelerationStructureSizes
 {
     uint64_t mResultSize;
     uint64_t mScratchSize;
+    uint64_t mAlignment;
 } AccelerationStructureSizes;
 
 #ifdef __cplusplus

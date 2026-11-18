@@ -440,6 +440,7 @@ void addPlacedAccelerationStructure(Raytracing* pRaytracing, const AccelerationS
     prepareBottomAccelerationStructure(pRaytracing, pDesc, pAS, &info);
     pOutSizes->mResultSize = info.ResultDataMaxSizeInBytes;
     pOutSizes->mScratchSize = info.ScratchDataSizeInBytes;
+    pOutSizes->mAlignment = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
     *ppAccelerationStructure = pAS;
 }
 

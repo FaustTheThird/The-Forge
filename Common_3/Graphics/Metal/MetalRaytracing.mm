@@ -76,6 +76,14 @@ struct IOS17_API AccelerationStructure
     };
     uint32_t                  mDescCount;
     AccelerationStructureType mType;
+    // A placed structure lives in a page's heap and has no scratch of its own: its build takes the caller's range.
+    NSUInteger                mPlacedSize;
+    bool                      mPlaced;
+};
+
+struct AccelerationStructurePage
+{
+    id<MTLHeap> pHeap;
 };
 
 IOS17_API
@@ -255,6 +263,58 @@ static inline FORGE_CONSTEXPR MTLAccelerationStructureInstanceOptions ToMTLASOpt
 }
 
 IOS17_API
+static MTLPrimitiveAccelerationStructureDescriptor* makeBottomDescriptor(const AccelerationStructureDesc* pDesc)
+{
+    NSMutableArray<MTLAccelerationStructureTriangleGeometryDescriptor*>* geomDescs = [[NSMutableArray alloc] init];
+
+    // Create a primitive acceleration structure descriptor to contain all the triangle geometry.
+    MTLPrimitiveAccelerationStructureDescriptor* asDesc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+
+    for (uint32_t j = 0; j < pDesc->mBottom.mDescCount; ++j)
+    {
+        AccelerationStructureGeometryDesc*                  pGeom = &pDesc->mBottom.pGeometryDescs[j];
+        MTLAccelerationStructureTriangleGeometryDescriptor* geomDesc = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+
+        if (pGeom->mIndexCount)
+        {
+            ASSERT(pGeom->pIndexBuffer);
+            geomDesc.indexBuffer = pGeom->pIndexBuffer->pBuffer;
+            geomDesc.indexBufferOffset = pGeom->mIndexOffset;
+            geomDesc.indexType = (pGeom->mIndexType == INDEX_TYPE_UINT16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32);
+            geomDesc.triangleCount = pGeom->mIndexCount / 3;
+        }
+        else
+        {
+            geomDesc.triangleCount = pGeom->mVertexCount / 3;
+        }
+
+        ASSERT(pGeom->pVertexBuffer);
+        ASSERT(pGeom->mVertexCount);
+
+        geomDesc.vertexBuffer = pGeom->pVertexBuffer->pBuffer;
+        geomDesc.vertexBufferOffset = pGeom->mVertexOffset;
+        geomDesc.vertexStride = pGeom->mVertexStride;
+        // Opacity lives on the geometry in D3D12/Vulkan and on this descriptor in Metal, and it
+        // defaults to non-opaque here. Left unset, every triangle is an any-hit CANDIDATE:
+        // intersection_query::next() stops at the first one and commits nothing, so a shader that
+        // reads the committed hit without running a candidate loop sees a miss and the ray traces
+        // through the whole scene.
+        geomDesc.opaque = (pGeom->mFlags & ACCELERATION_STRUCTURE_GEOMETRY_FLAG_OPAQUE) ? YES : NO;
+#if defined(ENABLE_ACCELERATION_STRUCTURE_VERTEX_FORMAT)
+        if (MTL_RAYTRACING_SUPPORTED)
+        {
+            geomDesc.vertexFormat = ToMTLAttributeFormat(pGeom->mVertexFormat);
+        }
+#endif
+
+        [geomDescs addObject:geomDesc];
+    }
+
+    asDesc.geometryDescriptors = geomDescs;
+    return asDesc;
+}
+
+IOS17_API
 void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructureDesc* pDesc,
                               AccelerationStructure** ppAccelerationStructure)
 {
@@ -291,55 +351,9 @@ void addAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructu
 
     if (ACCELERATION_STRUCTURE_TYPE_BOTTOM == pDesc->mType)
     {
-        NSMutableArray<MTLAccelerationStructureTriangleGeometryDescriptor*>* geomDescs = [[NSMutableArray alloc] init];
         pAS->mDescCount = pDesc->mBottom.mDescCount;
-
-        // Create a primitive acceleration structure descriptor to contain all the triangle geometry.
-        MTLPrimitiveAccelerationStructureDescriptor* asDesc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
-
-        for (uint32_t j = 0; j < pAS->mDescCount; ++j)
-        {
-            AccelerationStructureGeometryDesc*                  pGeom = &pDesc->mBottom.pGeometryDescs[j];
-            MTLAccelerationStructureTriangleGeometryDescriptor* geomDesc = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
-
-            if (pGeom->mIndexCount)
-            {
-                ASSERT(pGeom->pIndexBuffer);
-                geomDesc.indexBuffer = pGeom->pIndexBuffer->pBuffer;
-                geomDesc.indexBufferOffset = pGeom->mIndexOffset;
-                geomDesc.indexType = (pGeom->mIndexType == INDEX_TYPE_UINT16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32);
-                geomDesc.triangleCount = pGeom->mIndexCount / 3;
-            }
-            else
-            {
-                geomDesc.triangleCount = pGeom->mVertexCount / 3;
-            }
-
-            ASSERT(pGeom->pVertexBuffer);
-            ASSERT(pGeom->mVertexCount);
-
-            geomDesc.vertexBuffer = pGeom->pVertexBuffer->pBuffer;
-            geomDesc.vertexBufferOffset = pGeom->mVertexOffset;
-            geomDesc.vertexStride = pGeom->mVertexStride;
-            // Opacity lives on the geometry in D3D12/Vulkan and on this descriptor in Metal, and it
-            // defaults to non-opaque here. Left unset, every triangle is an any-hit CANDIDATE:
-            // intersection_query::next() stops at the first one and commits nothing, so a shader that
-            // reads the committed hit without running a candidate loop sees a miss and the ray traces
-            // through the whole scene.
-            geomDesc.opaque = (pGeom->mFlags & ACCELERATION_STRUCTURE_GEOMETRY_FLAG_OPAQUE) ? YES : NO;
-#if defined(ENABLE_ACCELERATION_STRUCTURE_VERTEX_FORMAT)
-            if (MTL_RAYTRACING_SUPPORTED)
-            {
-                geomDesc.vertexFormat = ToMTLAttributeFormat(pGeom->mVertexFormat);
-            }
-#endif
-
-            [geomDescs addObject:geomDesc];
-        }
-
-        asDesc.geometryDescriptors = geomDescs;
-        pAS->pBottomDesc = asDesc;
-        accelSizes = [device accelerationStructureSizesWithDescriptor:asDesc];
+        pAS->pBottomDesc = makeBottomDescriptor(pDesc);
+        accelSizes = [device accelerationStructureSizesWithDescriptor:pAS->pBottomDesc];
     }
     else
     {
@@ -505,10 +519,14 @@ void cmdBuildAccelerationStructure(Cmd* pCmd, Raytracing* pRaytracing, Raytracin
     AccelerationStructure* as = pDesc->pAccelerationStructure;
     if (ACCELERATION_STRUCTURE_TYPE_BOTTOM == as->mType)
     {
+        // A placed structure builds in the caller's range of a shared scratch buffer; one with its own scratch in that.
+        Buffer*    pScratch = as->pScratchBuffer ? as->pScratchBuffer : pDesc->pScratchBuffer;
+        NSUInteger scratchOffset = as->pScratchBuffer ? 0 : (NSUInteger)(pScratch->mOffset + pDesc->mScratchOffset);
+        ASSERT(pScratch);
         [pCmd->pASEncoder buildAccelerationStructure:as->mAS
                                           descriptor:as->pBottomDesc
-                                       scratchBuffer:as->pScratchBuffer->pBuffer
-                                 scratchBufferOffset:0];
+                                       scratchBuffer:pScratch->pBuffer
+                                 scratchBufferOffset:scratchOffset];
     }
     else
     {
@@ -539,50 +557,102 @@ void getMTLAccelerationStructureBottomReferences(AccelerationStructure* pAcceler
     *pOutReferences = pAccelerationStructure->pBottomASReferences;
 }
 
-// Placed structures are not offered on Metal yet: placing them needs an MTLHeap of the placement type whose structures
-// every encoder that traces declares resident with the heaps the backend already declares, and the alignment of each
-// structure from heapAccelerationStructureSizeAndAlignWithSize. Until then every structure keeps its own allocation.
+// Placed structures live in placement heaps (macOS 13 / iOS 16 for heap acceleration structures). The heap is not
+// added to the renderer's heap list: a bottom-level structure is made resident where the top-level one that names it
+// is bound, through its reference (getMTLAccelerationStructureBottomReferences), as one with its own allocation is.
+IOS17_API
 bool isAccelerationStructurePlacementSupported(Raytracing* pRaytracing)
 {
     UNREF_PARAM(pRaytracing);
+    if (@available(macOS 13.0, iOS 16.0, *))
+    {
+        return true;
+    }
     return false;
 }
 
+IOS17_API
 uint64_t getAccelerationStructurePlacementAlignment(Raytracing* pRaytracing)
 {
     UNREF_PARAM(pRaytracing);
-    return 1;
+    // The scratch offsets a build takes; each structure's own placement alignment comes with its sizes.
+    return 256;
 }
 
+IOS17_API
 void addAccelerationStructurePage(Raytracing* pRaytracing, uint64_t size, AccelerationStructurePage** ppPage)
 {
-    UNREF_PARAM(pRaytracing);
-    UNREF_PARAM(size);
-    *ppPage = NULL;
+    ASSERT(pRaytracing);
+    ASSERT(ppPage);
+    AccelerationStructurePage* pPage = (AccelerationStructurePage*)tf_calloc(1, sizeof(AccelerationStructurePage));
+    ASSERT(pPage);
+    MTLHeapDescriptor* heapDesc = [[MTLHeapDescriptor alloc] init];
+    heapDesc.type = MTLHeapTypePlacement;
+    heapDesc.storageMode = MTLStorageModePrivate;
+    heapDesc.hazardTrackingMode = MTLHazardTrackingModeTracked;
+    heapDesc.size = (NSUInteger)size;
+    pPage->pHeap = [pRaytracing->pRenderer->pDevice newHeapWithDescriptor:heapDesc];
+    ASSERT(pPage->pHeap);
+    pPage->pHeap.label = @"AccelerationStructurePage";
+    *ppPage = pPage;
 }
 
+IOS17_API
 void removeAccelerationStructurePage(Raytracing* pRaytracing, AccelerationStructurePage* pPage)
 {
     UNREF_PARAM(pRaytracing);
-    UNREF_PARAM(pPage);
+    if (!pPage)
+    {
+        return;
+    }
+    pPage->pHeap = nil;
+    tf_free(pPage);
 }
 
+IOS17_API
 void addPlacedAccelerationStructure(Raytracing* pRaytracing, const AccelerationStructureDesc* pDesc,
                                     AccelerationStructureSizes* pOutSizes, AccelerationStructure** ppAccelerationStructure)
 {
-    UNREF_PARAM(pRaytracing);
-    UNREF_PARAM(pDesc);
-    UNREF_PARAM(pOutSizes);
-    *ppAccelerationStructure = NULL;
+    ASSERT(pRaytracing);
+    ASSERT(pDesc);
+    ASSERT(pOutSizes);
+    ASSERT(ppAccelerationStructure);
+    ASSERT(ACCELERATION_STRUCTURE_TYPE_BOTTOM == pDesc->mType);
+
+    AccelerationStructure* pAS = (AccelerationStructure*)tf_calloc(1, sizeof(AccelerationStructure));
+    ASSERT(pAS);
+    pAS->mType = pDesc->mType;
+    pAS->mPlaced = true;
+    pAS->mDescCount = pDesc->mBottom.mDescCount;
+    pAS->pBottomDesc = makeBottomDescriptor(pDesc);
+
+    id<MTLDevice>                 device = pRaytracing->pRenderer->pDevice;
+    MTLAccelerationStructureSizes accelSizes = [device accelerationStructureSizesWithDescriptor:pAS->pBottomDesc];
+    pAS->mPlacedSize = accelSizes.accelerationStructureSize;
+    MTLSizeAndAlign placement = { accelSizes.accelerationStructureSize, 1 };
+    if (@available(macOS 13.0, iOS 16.0, *))
+    {
+        placement = [device heapAccelerationStructureSizeAndAlignWithSize:accelSizes.accelerationStructureSize];
+    }
+    pOutSizes->mResultSize = placement.size;
+    pOutSizes->mAlignment = placement.align;
+    pOutSizes->mScratchSize = accelSizes.buildScratchBufferSize;
+    *ppAccelerationStructure = pAS;
 }
 
+IOS17_API
 void placeAccelerationStructure(Raytracing* pRaytracing, AccelerationStructure* pAccelerationStructure,
                                 AccelerationStructurePage* pPage, uint64_t offset)
 {
     UNREF_PARAM(pRaytracing);
-    UNREF_PARAM(pAccelerationStructure);
-    UNREF_PARAM(pPage);
-    UNREF_PARAM(offset);
+    ASSERT(pAccelerationStructure);
+    ASSERT(pPage);
+    if (@available(macOS 13.0, iOS 16.0, *))
+    {
+        pAccelerationStructure->mAS = [pPage->pHeap newAccelerationStructureWithSize:pAccelerationStructure->mPlacedSize
+                                                                                offset:(NSUInteger)offset];
+    }
+    ASSERT(pAccelerationStructure->mAS);
 }
 
 struct SSVGFDenoiser
